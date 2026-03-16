@@ -7,6 +7,7 @@ import os
 from datetime import datetime
 import tempfile
 import subprocess
+import platform
 
 
 # ----------------------------
@@ -15,9 +16,14 @@ import subprocess
 def normalize_part(part) -> str:
     if pd.isna(part):
         return ""
+
     s = str(part).strip()
+
+    # Remove only spreadsheet-added .0
+    # Example: 001234.0 -> 001234
     if re.fullmatch(r"\d+\.0", s):
         s = s[:-2]
+
     return s
 
 
@@ -61,6 +67,252 @@ def safe_default_filename(prefix: str, ext: str = "csv") -> str:
 
 
 # ----------------------------
+# Smart paste parsing helpers
+# ----------------------------
+def looks_like_date(token: str) -> bool:
+    token = str(token).strip()
+    return bool(re.fullmatch(r"\d{1,2}/\d{1,2}/\d{2,4}", token))
+
+
+def is_integer_token(token: str) -> bool:
+    return bool(re.fullmatch(r"-?\d+", str(token).strip()))
+
+
+def looks_like_part(token: str) -> bool:
+    t = str(token).strip()
+
+    if not t:
+        return False
+
+    if looks_like_date(t):
+        return False
+
+    banned = {
+        "sam", "ashley", "joy", "shipper", "kl", "all",
+        "warehouse", "cart", "desk", "aline", "mvp",
+        "dnw1", "dnw2", "csr3", "cnr4", "ds", "fl", "v20",
+        "c", "e", "details", "to"
+    }
+    if t.lower() in banned:
+        return False
+
+    if re.fullmatch(r"[A-Za-z]?\d{6,12}", t):
+        return True
+
+    return False
+
+
+def clean_cell_value(v):
+    if pd.isna(v):
+        return ""
+    return str(v).strip()
+
+
+def split_pasted_line(line: str):
+    raw = str(line).rstrip("\n").strip()
+    if not raw:
+        return []
+
+    if "\t" in raw:
+        return [c.strip() for c in raw.split("\t")]
+
+    cols = re.split(r"\s{2,}", raw)
+    if len(cols) > 1:
+        return [c.strip() for c in cols]
+
+    return [c.strip() for c in raw.split()]
+
+
+def parse_block_record(block):
+    """
+    Expected layout:
+    0  request date
+    1  person
+    2  job 1
+    3  part number
+    4  on hand qty
+    5  room
+    6  location
+    7  pull qty
+    8  due date
+    9  job 2 / destination text
+    """
+    block = [clean_cell_value(x) for x in block if clean_cell_value(x) != ""]
+
+    if len(block) < 9:
+        return None
+
+    request_date = block[0] if len(block) > 0 else ""
+    person = block[1] if len(block) > 1 else ""
+    job1 = block[2] if len(block) > 2 else ""
+    part = normalize_part(block[3] if len(block) > 3 else "")
+    room = block[5] if len(block) > 5 else ""
+    loc = block[6] if len(block) > 6 else ""
+    qty_raw = block[7] if len(block) > 7 else ""
+    due_date = block[8] if len(block) > 8 else ""
+    job2 = " ".join(block[9:]).strip() if len(block) > 9 else ""
+
+    qty_val, _ = parse_qty(qty_raw)
+
+    if part and qty_val is not None:
+        return {
+            "REQUEST_DATE": request_date,
+            "PERSON": person,
+            "Job": job1,
+            "PART NUMBER": part,
+            "ON_HAND_QTY": block[4] if len(block) > 4 else "",
+            "RM": room,
+            "Location": loc,
+            "QTY PULLED": qty_val,
+            "SHIP_DATE": due_date,
+            "Job 2": job2
+        }
+
+    # Fallback smart scan
+    part_candidates = []
+    for i, c in enumerate(block):
+        if looks_like_part(c):
+            score = 0
+            if re.fullmatch(r"\d{7,12}", c):
+                score += 3
+            if re.fullmatch(r"[A-Za-z]\d{6,12}", c):
+                score += 3
+            if i >= 2:
+                score += 1
+            part_candidates.append((score, i, c))
+
+    if not part_candidates:
+        return None
+
+    part_candidates.sort(key=lambda x: (x[0], x[1]))
+    _, best_idx, best_part = part_candidates[-1]
+    part = normalize_part(best_part)
+
+    job1 = block[best_idx - 1] if best_idx >= 1 else ""
+    qty_val = None
+    qty_idx = None
+
+    for i, tok in enumerate(block):
+        tl = str(tok).lower().strip()
+        if tl == "all":
+            qty_val = "ALL"
+            qty_idx = i
+            break
+        if is_integer_token(tok):
+            if i + 1 < len(block) and looks_like_date(block[i + 1]):
+                qty_val = int(tok)
+                qty_idx = i
+                break
+
+    room = block[qty_idx - 2] if qty_idx is not None and qty_idx - 2 >= 0 else ""
+    loc = block[qty_idx - 1] if qty_idx is not None and qty_idx - 1 >= 0 else ""
+    due_date = block[qty_idx + 1] if qty_idx is not None and qty_idx + 1 < len(block) else ""
+    job2 = block[qty_idx + 2] if qty_idx is not None and qty_idx + 2 < len(block) else ""
+
+    if not part or qty_val is None:
+        return None
+
+    return {
+        "REQUEST_DATE": request_date,
+        "PERSON": person,
+        "Job": job1,
+        "PART NUMBER": part,
+        "ON_HAND_QTY": "",
+        "RM": room,
+        "Location": loc,
+        "QTY PULLED": qty_val,
+        "SHIP_DATE": due_date,
+        "Job 2": job2
+    }
+
+
+def parse_pasted_pull_rows(raw_text: str):
+    """
+    Handles BOTH:
+    1. tab-separated row paste from Sheets/Excel
+    2. vertically stacked copied cells
+    """
+    output_cols = [
+        "REQUEST_DATE", "PERSON", "Job", "PART NUMBER", "ON_HAND_QTY",
+        "RM", "Location", "QTY PULLED", "SHIP_DATE", "Job 2"
+    ]
+
+    if not raw_text.strip():
+        return pd.DataFrame(columns=output_cols)
+
+    # First try direct row-based parsing from tabs (best for Sheets)
+    parsed_rows = []
+    for raw_line in raw_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        low = line.lower()
+        if "please bring today" in low or low.startswith("to:") or "pulls for" in low or low == "details":
+            continue
+
+        cols = split_pasted_line(line)
+        cols = [clean_cell_value(c) for c in cols if clean_cell_value(c) != ""]
+
+        # Exact 10-column layout from Sheets/email
+        if len(cols) >= 10 and looks_like_date(cols[0]):
+            record = {
+                "REQUEST_DATE": cols[0],
+                "PERSON": cols[1],
+                "Job": cols[2],
+                "PART NUMBER": normalize_part(cols[3]),
+                "ON_HAND_QTY": cols[4],
+                "RM": cols[5],
+                "Location": cols[6],
+                "QTY PULLED": parse_qty(cols[7])[0],
+                "SHIP_DATE": cols[8],
+                "Job 2": " ".join(cols[9:]).strip()
+            }
+            if record["PART NUMBER"] and record["QTY PULLED"] is not None:
+                parsed_rows.append(record)
+                continue
+
+        # Fallback
+        record = parse_block_record(cols)
+        if record:
+            parsed_rows.append(record)
+
+    if parsed_rows:
+        return pd.DataFrame(parsed_rows, columns=output_cols)
+
+    # Vertical stacked mode
+    raw_lines = [line.rstrip() for line in raw_text.splitlines()]
+    lines = [clean_cell_value(x) for x in raw_lines if clean_cell_value(x) != ""]
+
+    date_positions = [i for i, x in enumerate(lines) if looks_like_date(x)]
+
+    if date_positions and looks_like_date(lines[0]):
+        blocks = []
+        current = []
+
+        for line in lines:
+            if looks_like_date(line) and current:
+                blocks.append(current)
+                current = [line]
+            else:
+                current.append(line)
+
+        if current:
+            blocks.append(current)
+
+        parsed = []
+        for blk in blocks:
+            record = parse_block_record(blk)
+            if record:
+                parsed.append(record)
+
+        if parsed:
+            return pd.DataFrame(parsed, columns=output_cols)
+
+    return pd.DataFrame(columns=output_cols)
+
+
+# ----------------------------
 # App
 # ----------------------------
 class WarehouseApp(tk.Tk):
@@ -93,21 +345,20 @@ class WarehouseApp(tk.Tk):
 
         # Zebra / pull optional columns
         self.P_JOB = "Job"
-        self.P_DEST = "Destination"
+        self.P_JOB2 = "Job 2"
         self.P_RM = "RM"
         self.P_LOC = "Location"
 
-        # Fallback positional mapping for your current pull-list layout
-        # C = job, D = part, F = RM, G = loc, H = qty, J = destination
+        # Fallback positional mapping
         self.P_COL_JOB_IDX = 2
         self.P_COL_PART_IDX = 3
         self.P_COL_RM_IDX = 5
         self.P_COL_LOC_IDX = 6
         self.P_COL_QTY_IDX = 7
-        self.P_COL_DEST_IDX = 9
+        self.P_COL_JOB2_IDX = 9
 
         # Zebra printer name
-        self.ZEBRA_PRINTER_NAME = "ZDesigner ZT230"
+        self.ZEBRA_PRINTER_NAME = "Zebra_Technologies_ZTC_ZT230_200dpi_ZPL"
 
         # Safety options
         self.DRY_RUN_MODE = tk.BooleanVar(value=False)
@@ -123,6 +374,7 @@ class WarehouseApp(tk.Tk):
         file_menu = tk.Menu(menubar, tearoff=False)
         file_menu.add_command(label="Load Warehouse CSV...", command=self.load_warehouse)
         file_menu.add_command(label="Load Pull List CSV...", command=self.load_pull_list)
+        file_menu.add_command(label="Paste Pull List...", command=self.open_paste_pull_list_window)
         file_menu.add_separator()
         file_menu.add_command(label="Save Updated Warehouse As...", command=self.save_updated_warehouse)
         file_menu.add_command(label="Export Log As...", command=self.export_log)
@@ -145,6 +397,7 @@ class WarehouseApp(tk.Tk):
 
         pull_menu = tk.Menu(menubar, tearoff=False)
         pull_menu.add_command(label="Preview Pull List", command=self.preview_pull_list)
+        pull_menu.add_command(label="Paste Pull List", command=self.open_paste_pull_list_window)
         pull_menu.add_command(label="Apply Pull List to Inventory", command=self.apply_pull_list)
         menubar.add_cascade(label="Pull List", menu=pull_menu)
 
@@ -177,6 +430,7 @@ class WarehouseApp(tk.Tk):
 
         ttk.Button(top, text="Load Warehouse", command=self.load_warehouse).pack(side=tk.LEFT)
         ttk.Button(top, text="Load Pull List", command=self.load_pull_list).pack(side=tk.LEFT, padx=6)
+        ttk.Button(top, text="Paste Pull List", command=self.open_paste_pull_list_window).pack(side=tk.LEFT, padx=6)
         ttk.Button(top, text="Apply Pull", command=self.apply_pull_list).pack(side=tk.LEFT, padx=6)
 
         self.status_var = tk.StringVar(value="Load a warehouse CSV to begin.")
@@ -252,12 +506,13 @@ class WarehouseApp(tk.Tk):
         if not path:
             return
         try:
-            df = pd.read_csv(path)
+            df = pd.read_csv(path, dtype=str, keep_default_na=False)
         except Exception as e:
             messagebox.showerror("Load Error", f"Could not load warehouse file.\n\n{e}")
             return
 
         self.last_warehouse_path = path
+        df.columns = [str(c).strip() for c in df.columns]
 
         if self.AUTO_RENAME_COMMENTS_TO_INOUT:
             if self.W_INOUT not in df.columns and self.OLD_COMMENTS_NAME in df.columns:
@@ -265,6 +520,7 @@ class WarehouseApp(tk.Tk):
 
         if self.W_PART in df.columns:
             df[self.W_PART] = df[self.W_PART].apply(normalize_part)
+
         if self.W_QTY in df.columns:
             df[self.W_QTY] = pd.to_numeric(df[self.W_QTY], errors="coerce").fillna(0).astype(int)
 
@@ -285,10 +541,12 @@ class WarehouseApp(tk.Tk):
         if not path:
             return
         try:
-            df = pd.read_csv(path)
+            df = pd.read_csv(path, dtype=str, keep_default_na=False)
         except Exception as e:
             messagebox.showerror("Load Error", f"Could not load pull list file.\n\n{e}")
             return
+
+        df.columns = [str(c).strip() for c in df.columns]
 
         if self.P_PART in df.columns:
             df[self.P_PART] = df[self.P_PART].apply(normalize_part)
@@ -296,6 +554,66 @@ class WarehouseApp(tk.Tk):
         self.pull_df = df
         self.preview_pull_list()
         self.status_var.set(f"Pull list loaded: {os.path.basename(path)}")
+
+    def open_paste_pull_list_window(self):
+        win = tk.Toplevel(self)
+        win.title("Paste Pull List")
+        win.geometry("900x650")
+        win.grab_set()
+
+        frm = ttk.Frame(win, padding=12)
+        frm.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(
+            frm,
+            text="Paste the full pull list below",
+            font=("Segoe UI", 11, "bold")
+        ).pack(anchor="w", pady=(0, 8))
+
+        ttk.Label(
+            frm,
+            text="Expected columns: Date | Person | Job 1 | Part Number | On Hand Qty | Room | Location | Pull Qty | Due Date | Job 2",
+        ).pack(anchor="w", pady=(0, 8))
+
+        text_box = tk.Text(frm, wrap="none")
+        text_box.pack(fill=tk.BOTH, expand=True)
+
+        preview_label = ttk.Label(frm, text="")
+        preview_label.pack(anchor="w", pady=(8, 0))
+
+        btns = ttk.Frame(frm)
+        btns.pack(fill=tk.X, pady=(10, 0))
+
+        def load_pasted_data():
+            raw = text_box.get("1.0", tk.END).strip()
+            if not raw:
+                messagebox.showinfo("No Data", "Paste a pull list first.")
+                return
+
+            try:
+                df = parse_pasted_pull_rows(raw)
+
+                if df.empty:
+                    raise ValueError(
+                        "No valid pull rows were detected.\n"
+                        "Try copying the rows from the email/table again."
+                    )
+
+                df[self.P_PART] = df[self.P_PART].apply(normalize_part)
+
+                self.pull_df = df
+                self.preview_pull_list()
+
+                preview_label.config(text=f"Loaded {len(df)} rows from pasted data.")
+                self.status_var.set(f"Pasted pull list loaded ({len(df)} rows).")
+                messagebox.showinfo("Loaded", f"Pasted pull list loaded successfully.\nRows: {len(df)}")
+                win.destroy()
+
+            except Exception as e:
+                messagebox.showerror("Paste Error", f"Could not parse pasted pull list.\n\n{e}")
+
+        ttk.Button(btns, text="Load Pasted Pull List", command=load_pasted_data).pack(side=tk.RIGHT)
+        ttk.Button(btns, text="Cancel", command=win.destroy).pack(side=tk.RIGHT, padx=(0, 8))
 
     def refresh_inventory_view(self, df_to_show=None):
         if self.warehouse_df is None:
@@ -312,10 +630,11 @@ class WarehouseApp(tk.Tk):
             return None
 
         part = normalize_part(part)
-        matches = self.warehouse_df[self.warehouse_df[self.W_PART] == part]
-        if matches.empty:
+        matches = self.warehouse_df[self.W_PART] == part
+        matched = self.warehouse_df[matches]
+        if matched.empty:
             return None
-        return int(matches.index[0])
+        return int(matched.index[0])
 
     def _get_selected_part(self):
         sel = self.tree.selection()
@@ -670,7 +989,7 @@ class WarehouseApp(tk.Tk):
             wh.at[w_idx, self.W_QTY] = after
             wh.at[w_idx, self.W_DATE_MAIN] = run_date_main
             wh.at[w_idx, self.W_DATE] = run_last_updated
-            wh.at[w_idx, self.W_INOUT] = -sent
+            wh.at[w_idx, self.W_INOUT] = str(-sent)
 
             changes.append({
                 "timestamp": run_ts,
@@ -946,10 +1265,22 @@ class WarehouseApp(tk.Tk):
             return row.get(named_col, "")
         return self._row_val_by_idx(row, fallback_idx)
 
+    def _combine_job_text(self, job1, job2):
+        job1 = "" if pd.isna(job1) else str(job1).strip()
+        job2 = "" if pd.isna(job2) else str(job2).strip()
+
+        if job1 and job2:
+            return f"{job1} {job2}"
+        if job1:
+            return job1
+        if job2:
+            return job2
+        return ""
+
     def build_tag_rows(self):
         """
         Build ONE tag per pull-list row, using actual sent qty logic.
-        This stays row-based so JOB and DEST do not get merged incorrectly.
+        Combines Job + Job 2 onto the tag.
         """
         if self.warehouse_df is None or self.pull_df is None:
             return []
@@ -992,34 +1323,31 @@ class WarehouseApp(tk.Tk):
             if sent <= 0:
                 continue
 
-            job = self._pull_value(row, self.P_JOB, self.P_COL_JOB_IDX)
+            job1 = self._pull_value(row, self.P_JOB, self.P_COL_JOB_IDX)
+            job2 = self._pull_value(row, self.P_JOB2, self.P_COL_JOB2_IDX)
             rm = self._pull_value(row, self.P_RM, self.P_COL_RM_IDX)
             loc = self._pull_value(row, self.P_LOC, self.P_COL_LOC_IDX)
-            dest = self._pull_value(row, self.P_DEST, self.P_COL_DEST_IDX)
 
             rm = "" if pd.isna(rm) else str(rm).strip()
             loc = "" if pd.isna(loc) else str(loc).strip()
-            job = "" if pd.isna(job) else str(job).strip()
-            dest = "" if pd.isna(dest) else str(dest).strip()
 
+            job_text = self._combine_job_text(job1, job2)
             loc_full = " ".join([x for x in [rm, loc] if x and x.lower() != "nan"]).strip()
 
             tag_rows.append({
                 "part": self._zpl_safe(part),
                 "qty": sent,
-                "job": self._zpl_safe(job),
-                "dest": self._zpl_safe(dest),
+                "job": self._zpl_safe(job_text),
                 "loc": self._zpl_safe(loc_full),
                 "date": run_date
             })
 
         return tag_rows
 
-    def make_zebra_tag_zpl(self, part, qty, job, dest, loc, date_text):
+    def make_zebra_tag_zpl(self, part, qty, job, loc, date_text):
         part = self._zpl_safe(part)
         qty = self._zpl_safe(qty)
         job = self._zpl_safe(job)
-        dest = self._zpl_safe(dest)
         loc = self._zpl_safe(loc)
         date_text = self._zpl_safe(date_text)
 
@@ -1039,15 +1367,12 @@ class WarehouseApp(tk.Tk):
 ^FO40,185^A0N,36,36^FDJOB:^FS
 ^FO170,185^A0N,36,36^FD{job}^FS
 
-^FO40,245^A0N,36,36^FDDEST:^FS
-^FO170,245^A0N,36,36^FD{dest}^FS
+^FO40,245^A0N,36,36^FDLOC:^FS
+^FO170,245^A0N,36,36^FD{loc}^FS
 
-^FO40,305^A0N,36,36^FDLOC:^FS
-^FO170,305^A0N,36,36^FD{loc}^FS
+^FO40,305^A0N,30,30^FDDATE: {date_text}^FS
 
-^FO40,365^A0N,30,30^FDDATE: {date_text}^FS
-
-^FO40,440^BY3,3,120
+^FO40,390^BY3,3,120
 ^BCN,120,Y,N,N
 ^FD{part}^FS
 
@@ -1067,7 +1392,6 @@ class WarehouseApp(tk.Tk):
                     part=row["part"],
                     qty=row["qty"],
                     job=row["job"],
-                    dest=row["dest"],
                     loc=row["loc"],
                     date_text=row["date"]
                 )
@@ -1103,8 +1427,10 @@ class WarehouseApp(tk.Tk):
 
     def print_zebra_tags(self):
         """
-        Windows raw print path for Zebra printers.
-        If direct print fails, user can still export the .zpl and print manually.
+        Windows:
+            Uses win32print RAW output.
+        Mac/Linux:
+            Writes temp .zpl file and sends with lp.
         """
         if self.warehouse_df is None or self.pull_df is None:
             messagebox.showinfo("Missing Data", "Load warehouse + pull list first.")
@@ -1120,36 +1446,72 @@ class WarehouseApp(tk.Tk):
             messagebox.showinfo("Printer Not Set", "Set the Zebra printer name in Settings first.")
             return
 
-        try:
-            import win32print
+        system_name = platform.system().lower()
 
-            hprinter = win32print.OpenPrinter(printer_name)
+        if "windows" in system_name:
             try:
-                win32print.StartDocPrinter(hprinter, 1, ("Tekmor Zebra Tags", None, "RAW"))
-                win32print.StartPagePrinter(hprinter)
-                win32print.WritePrinter(hprinter, zpl_text.encode("utf-8"))
-                win32print.EndPagePrinter(hprinter)
-                win32print.EndDocPrinter(hprinter)
+                import win32print
+
+                hprinter = win32print.OpenPrinter(printer_name)
+                try:
+                    win32print.StartDocPrinter(hprinter, 1, ("Tekmor Zebra Tags", None, "RAW"))
+                    win32print.StartPagePrinter(hprinter)
+                    win32print.WritePrinter(hprinter, zpl_text.encode("utf-8"))
+                    win32print.EndPagePrinter(hprinter)
+                    win32print.EndDocPrinter(hprinter)
+                finally:
+                    win32print.ClosePrinter(hprinter)
+
+                self.status_var.set(f"Printed {len(tag_rows)} Zebra tag(s) to {printer_name}")
+                messagebox.showinfo("Printed", f"Sent {len(tag_rows)} tag(s) to:\n{printer_name}")
+                return
+
+            except ImportError:
+                messagebox.showerror(
+                    "Printing Not Available",
+                    "Direct Windows printing needs pywin32 installed.\n\n"
+                    "Run:\n"
+                    "pip install pywin32\n\n"
+                    "You can still use File → Export Zebra Tags (.zpl)... right now."
+                )
+                return
+            except Exception as e:
+                messagebox.showerror(
+                    "Print Error",
+                    f"Could not send tags to printer '{printer_name}'.\n\n{e}\n\n"
+                    "You can still use File → Export Zebra Tags (.zpl)..."
+                )
+                return
+
+        else:
+            tmp_path = None
+            try:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".zpl", mode="w", encoding="utf-8") as tmp:
+                    tmp.write(zpl_text)
+                    tmp_path = tmp.name
+
+                cmd = ["lp", "-d", printer_name, "-o", "raw", tmp_path]
+                result = subprocess.run(cmd, capture_output=True, text=True)
+
+                if result.returncode != 0:
+                    raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "Unknown lp error")
+
+                self.status_var.set(f"Printed {len(tag_rows)} Zebra tag(s) to {printer_name}")
+                messagebox.showinfo("Printed", f"Sent {len(tag_rows)} tag(s) to:\n{printer_name}")
+
+            except Exception as e:
+                messagebox.showerror(
+                    "Print Error",
+                    f"Could not send tags to printer '{printer_name}'.\n\n{e}\n\n"
+                    "Make sure the printer name matches exactly what macOS shows in Printers & Scanners.\n"
+                    "You can still use File → Export Zebra Tags (.zpl)..."
+                )
             finally:
-                win32print.ClosePrinter(hprinter)
-
-            self.status_var.set(f"Printed {len(tag_rows)} Zebra tag(s) to {printer_name}")
-            messagebox.showinfo("Printed", f"Sent {len(tag_rows)} tag(s) to:\n{printer_name}")
-
-        except ImportError:
-            messagebox.showerror(
-                "Printing Not Available",
-                "Direct Windows printing needs pywin32 installed.\n\n"
-                "Run:\n"
-                "pip install pywin32\n\n"
-                "You can still use File → Export Zebra Tags (.zpl)... right now."
-            )
-        except Exception as e:
-            messagebox.showerror(
-                "Print Error",
-                f"Could not send tags to printer '{printer_name}'.\n\n{e}\n\n"
-                "You can still use File → Export Zebra Tags (.zpl)..."
-            )
+                if tmp_path and os.path.exists(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except Exception:
+                        pass
 
     # ---------- Outputs ----------
     def _show_shipment_summary(self, shipment_rows):
@@ -1317,14 +1679,18 @@ class WarehouseApp(tk.Tk):
             lines.append("Pull List (first 15 rows)")
             lines.append("-" * 28)
 
-        lines.append(self.pull_df.head(15).to_string(index=False))
+        try:
+            lines.append(self.pull_df.head(15).to_string(index=False))
+        except Exception:
+            lines.append(str(self.pull_df.head(15)))
+
         self._set_pull_preview("\n".join(lines))
 
     # ---------- Settings ----------
     def open_settings(self):
         win = tk.Toplevel(self)
         win.title("Settings")
-        win.geometry("650x620")
+        win.geometry("650x650")
         win.grab_set()
 
         frm = ttk.Frame(win, padding=12)
@@ -1366,13 +1732,13 @@ class WarehouseApp(tk.Tk):
 
         ttk.Separator(frm).grid(row=9, column=0, columnspan=2, sticky="ew", pady=12)
 
-        ttk.Label(frm, text="Pull Job Column:").grid(row=10, column=0, sticky="w")
+        ttk.Label(frm, text="Pull Job 1 Column:").grid(row=10, column=0, sticky="w")
         p_job = tk.StringVar(value=self.P_JOB)
         ttk.Entry(frm, textvariable=p_job).grid(row=10, column=1, sticky="ew")
 
-        ttk.Label(frm, text="Pull Destination Column:").grid(row=11, column=0, sticky="w")
-        p_dest = tk.StringVar(value=self.P_DEST)
-        ttk.Entry(frm, textvariable=p_dest).grid(row=11, column=1, sticky="ew")
+        ttk.Label(frm, text="Pull Job 2 Column:").grid(row=11, column=0, sticky="w")
+        p_job2 = tk.StringVar(value=self.P_JOB2)
+        ttk.Entry(frm, textvariable=p_job2).grid(row=11, column=1, sticky="ew")
 
         ttk.Label(frm, text="Pull RM Column:").grid(row=12, column=0, sticky="w")
         p_rm = tk.StringVar(value=self.P_RM)
@@ -1398,7 +1764,7 @@ class WarehouseApp(tk.Tk):
             self.P_PART = p_part.get().strip()
             self.P_QTY = p_qty.get().strip()
             self.P_JOB = p_job.get().strip()
-            self.P_DEST = p_dest.get().strip()
+            self.P_JOB2 = p_job2.get().strip()
             self.P_RM = p_rm.get().strip()
             self.P_LOC = p_loc.get().strip()
             self.ZEBRA_PRINTER_NAME = zebra_name.get().strip()
@@ -1420,7 +1786,9 @@ class WarehouseApp(tk.Tk):
             "- Manual Receive (+)\n"
             "- Manual Send (-)\n"
             "- Dry Run / backups / logs / shortages\n"
-            "- Zebra ZT230 tag export / print\n"
+            "- Paste full pull list directly into app\n"
+            "- Combines Job 1 + Job 2 on Zebra tags\n"
+            "- Zebra ZT230 tag export / print (Windows + Mac/Linux)\n"
         )
 
     # ---------- Tree utils ----------

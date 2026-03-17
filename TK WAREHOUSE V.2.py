@@ -327,6 +327,7 @@ class WarehouseApp(tk.Tk):
         self.log_df = pd.DataFrame()
         self.last_warehouse_path = None
         self._last_shortages_df = pd.DataFrame()
+        self.last_pull_plan_df = pd.DataFrame()
 
         # Warehouse columns
         self.W_PART = "Part"
@@ -382,6 +383,7 @@ class WarehouseApp(tk.Tk):
         file_menu.add_separator()
         file_menu.add_command(label="Export Zebra Tags (.zpl)...", command=self.export_zebra_tags)
         file_menu.add_command(label="Print Zebra Tags...", command=self.print_zebra_tags)
+        file_menu.add_command(label="Manual Print Tag...", command=self.open_manual_print_window)
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self.destroy)
         menubar.add_cascade(label="File", menu=file_menu)
@@ -432,6 +434,7 @@ class WarehouseApp(tk.Tk):
         ttk.Button(top, text="Load Pull List", command=self.load_pull_list).pack(side=tk.LEFT, padx=6)
         ttk.Button(top, text="Paste Pull List", command=self.open_paste_pull_list_window).pack(side=tk.LEFT, padx=6)
         ttk.Button(top, text="Apply Pull", command=self.apply_pull_list).pack(side=tk.LEFT, padx=6)
+        ttk.Button(top, text="Manual Print Tag", command=self.open_manual_print_window).pack(side=tk.LEFT, padx=6)
 
         self.status_var = tk.StringVar(value="Load a warehouse CSV to begin.")
         ttk.Label(top, textvariable=self.status_var).pack(side=tk.RIGHT)
@@ -956,6 +959,7 @@ class WarehouseApp(tk.Tk):
                 wh[col] = ""
 
         plan_df, pre_log_df, shortages_df = self.build_pull_plan()
+        self.last_pull_plan_df = plan_df.copy()
 
         ok = self.confirm_pull_window(plan_df)
         if not ok:
@@ -1279,8 +1283,8 @@ class WarehouseApp(tk.Tk):
 
     def build_tag_rows(self):
         """
-        Build ONE tag per pull-list row, using actual sent qty logic.
-        Combines Job + Job 2 onto the tag.
+        Legacy fallback: builds tags from current warehouse state.
+        Prefer build_tag_rows_from_plan() whenever possible.
         """
         if self.warehouse_df is None or self.pull_df is None:
             return []
@@ -1307,7 +1311,7 @@ class WarehouseApp(tk.Tk):
             if not part:
                 continue
 
-            qty, qty_type = parse_qty(qty_raw)
+            qty, _ = parse_qty(qty_raw)
             if qty is None:
                 continue
 
@@ -1322,6 +1326,77 @@ class WarehouseApp(tk.Tk):
 
             if sent <= 0:
                 continue
+
+            job1 = self._pull_value(row, self.P_JOB, self.P_COL_JOB_IDX)
+            job2 = self._pull_value(row, self.P_JOB2, self.P_COL_JOB2_IDX)
+            rm = self._pull_value(row, self.P_RM, self.P_COL_RM_IDX)
+            loc = self._pull_value(row, self.P_LOC, self.P_COL_LOC_IDX)
+
+            rm = "" if pd.isna(rm) else str(rm).strip()
+            loc = "" if pd.isna(loc) else str(loc).strip()
+
+            job_text = self._combine_job_text(job1, job2)
+            loc_full = " ".join([x for x in [rm, loc] if x and x.lower() != "nan"]).strip()
+
+            tag_rows.append({
+                "part": self._zpl_safe(part),
+                "qty": sent,
+                "job": self._zpl_safe(job_text),
+                "loc": self._zpl_safe(loc_full),
+                "date": run_date
+            })
+
+        return tag_rows
+
+    def build_tag_rows_from_plan(self, plan_df=None):
+        """
+        Build tags from the actual last pull plan so printing still works
+        after inventory has already been updated.
+        """
+        if self.pull_df is None:
+            return []
+
+        if plan_df is None:
+            plan_df = self.last_pull_plan_df
+
+        if plan_df is None or plan_df.empty:
+            return []
+
+        sent_map = {}
+        for _, r in plan_df.iterrows():
+            part = normalize_part(r.get("part", ""))
+            sent = int(r.get("sent", 0))
+            if part:
+                sent_map[part] = sent
+
+        remaining_to_tag = sent_map.copy()
+        tag_rows = []
+        run_date = today_mdy2()
+
+        for _, row in self.pull_df.iterrows():
+            part = normalize_part(self._pull_value(row, self.P_PART, self.P_COL_PART_IDX))
+            if not part or part not in remaining_to_tag:
+                continue
+
+            qty_left_for_part = int(remaining_to_tag.get(part, 0))
+            if qty_left_for_part <= 0:
+                continue
+
+            qty_raw = self._pull_value(row, self.P_QTY, self.P_COL_QTY_IDX)
+            qty, _ = parse_qty(qty_raw)
+
+            if qty is None:
+                continue
+
+            if qty == "ALL":
+                sent = qty_left_for_part
+            else:
+                sent = min(int(qty), qty_left_for_part)
+
+            if sent <= 0:
+                continue
+
+            remaining_to_tag[part] -= sent
 
             job1 = self._pull_value(row, self.P_JOB, self.P_COL_JOB_IDX)
             job2 = self._pull_value(row, self.P_JOB2, self.P_COL_JOB2_IDX)
@@ -1381,7 +1456,11 @@ class WarehouseApp(tk.Tk):
         return zpl.strip() + "\n"
 
     def _build_all_zpl(self):
-        tag_rows = self.build_tag_rows()
+        if self.last_pull_plan_df is not None and not self.last_pull_plan_df.empty:
+            tag_rows = self.build_tag_rows_from_plan(self.last_pull_plan_df)
+        else:
+            tag_rows = self.build_tag_rows()
+
         if not tag_rows:
             return "", []
 
@@ -1397,6 +1476,56 @@ class WarehouseApp(tk.Tk):
                 )
             )
         return "".join(zpl_chunks), tag_rows
+
+    def _send_zpl_to_printer(self, zpl_text, printer_name):
+        system_name = platform.system().lower()
+
+        if "windows" in system_name:
+            try:
+                import win32print
+
+                hprinter = win32print.OpenPrinter(printer_name)
+                try:
+                    win32print.StartDocPrinter(hprinter, 1, ("Tekmor Zebra Tags", None, "RAW"))
+                    win32print.StartPagePrinter(hprinter)
+                    win32print.WritePrinter(hprinter, zpl_text.encode("utf-8"))
+                    win32print.EndPagePrinter(hprinter)
+                    win32print.EndDocPrinter(hprinter)
+                finally:
+                    win32print.ClosePrinter(hprinter)
+
+                return True, ""
+            except ImportError:
+                return False, (
+                    "Direct Windows printing needs pywin32 installed.\n\n"
+                    "Run:\n"
+                    "pip install pywin32"
+                )
+            except Exception as e:
+                return False, str(e)
+
+        else:
+            tmp_path = None
+            try:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".zpl", mode="w", encoding="utf-8") as tmp:
+                    tmp.write(zpl_text)
+                    tmp_path = tmp.name
+
+                cmd = ["lp", "-d", printer_name, "-o", "raw", tmp_path]
+                result = subprocess.run(cmd, capture_output=True, text=True)
+
+                if result.returncode != 0:
+                    raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "Unknown lp error")
+
+                return True, ""
+            except Exception as e:
+                return False, str(e)
+            finally:
+                if tmp_path and os.path.exists(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except Exception:
+                        pass
 
     def export_zebra_tags(self):
         if self.warehouse_df is None or self.pull_df is None:
@@ -1426,12 +1555,6 @@ class WarehouseApp(tk.Tk):
             messagebox.showerror("Export Error", f"Could not export Zebra tags.\n\n{e}")
 
     def print_zebra_tags(self):
-        """
-        Windows:
-            Uses win32print RAW output.
-        Mac/Linux:
-            Writes temp .zpl file and sends with lp.
-        """
         if self.warehouse_df is None or self.pull_df is None:
             messagebox.showinfo("Missing Data", "Load warehouse + pull list first.")
             return
@@ -1446,72 +1569,177 @@ class WarehouseApp(tk.Tk):
             messagebox.showinfo("Printer Not Set", "Set the Zebra printer name in Settings first.")
             return
 
-        system_name = platform.system().lower()
-
-        if "windows" in system_name:
-            try:
-                import win32print
-
-                hprinter = win32print.OpenPrinter(printer_name)
-                try:
-                    win32print.StartDocPrinter(hprinter, 1, ("Tekmor Zebra Tags", None, "RAW"))
-                    win32print.StartPagePrinter(hprinter)
-                    win32print.WritePrinter(hprinter, zpl_text.encode("utf-8"))
-                    win32print.EndPagePrinter(hprinter)
-                    win32print.EndDocPrinter(hprinter)
-                finally:
-                    win32print.ClosePrinter(hprinter)
-
-                self.status_var.set(f"Printed {len(tag_rows)} Zebra tag(s) to {printer_name}")
-                messagebox.showinfo("Printed", f"Sent {len(tag_rows)} tag(s) to:\n{printer_name}")
-                return
-
-            except ImportError:
-                messagebox.showerror(
-                    "Printing Not Available",
-                    "Direct Windows printing needs pywin32 installed.\n\n"
-                    "Run:\n"
-                    "pip install pywin32\n\n"
-                    "You can still use File → Export Zebra Tags (.zpl)... right now."
-                )
-                return
-            except Exception as e:
-                messagebox.showerror(
-                    "Print Error",
-                    f"Could not send tags to printer '{printer_name}'.\n\n{e}\n\n"
-                    "You can still use File → Export Zebra Tags (.zpl)..."
-                )
-                return
-
+        ok, err = self._send_zpl_to_printer(zpl_text, printer_name)
+        if ok:
+            self.status_var.set(f"Printed {len(tag_rows)} Zebra tag(s) to {printer_name}")
+            messagebox.showinfo("Printed", f"Sent {len(tag_rows)} tag(s) to:\n{printer_name}")
         else:
-            tmp_path = None
+            messagebox.showerror(
+                "Print Error",
+                f"Could not send tags to printer '{printer_name}'.\n\n{err}\n\n"
+                "Make sure the printer name matches exactly.\n"
+                "You can still use File → Export Zebra Tags (.zpl)..."
+            )
+
+    def open_manual_print_window(self):
+        win = tk.Toplevel(self)
+        win.title("Manual Print Tag")
+        win.geometry("560x420")
+        win.grab_set()
+
+        frm = ttk.Frame(win, padding=16)
+        frm.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(frm, text="Manual Print Tag", font=("Segoe UI", 12, "bold")).grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 12)
+        )
+
+        ttk.Label(frm, text="Part Number:").grid(row=1, column=0, sticky="w", pady=4)
+        part_var = tk.StringVar()
+        selected_part = self._get_selected_part() or normalize_part(self.search_var.get())
+        part_var.set(selected_part)
+        ttk.Entry(frm, textvariable=part_var).grid(row=1, column=1, sticky="ew", pady=4)
+
+        ttk.Label(frm, text="Quantity:").grid(row=2, column=0, sticky="w", pady=4)
+        qty_var = tk.StringVar(value="1")
+        ttk.Entry(frm, textvariable=qty_var).grid(row=2, column=1, sticky="ew", pady=4)
+
+        ttk.Label(frm, text="Job:").grid(row=3, column=0, sticky="w", pady=4)
+        job_var = tk.StringVar()
+        ttk.Entry(frm, textvariable=job_var).grid(row=3, column=1, sticky="ew", pady=4)
+
+        ttk.Label(frm, text="Location:").grid(row=4, column=0, sticky="w", pady=4)
+        loc_var = tk.StringVar()
+        ttk.Entry(frm, textvariable=loc_var).grid(row=4, column=1, sticky="ew", pady=4)
+
+        ttk.Label(frm, text="Date:").grid(row=5, column=0, sticky="w", pady=4)
+        date_var = tk.StringVar(value=today_mdy2())
+        ttk.Entry(frm, textvariable=date_var).grid(row=5, column=1, sticky="ew", pady=4)
+
+        preview_text = tk.Text(frm, height=10, wrap="word")
+        preview_text.grid(row=6, column=0, columnspan=2, sticky="nsew", pady=(12, 8))
+        preview_text.configure(state="disabled")
+
+        frm.columnconfigure(1, weight=1)
+        frm.rowconfigure(6, weight=1)
+
+        def set_preview(text):
+            preview_text.configure(state="normal")
+            preview_text.delete("1.0", tk.END)
+            preview_text.insert(tk.END, text)
+            preview_text.configure(state="disabled")
+
+        def build_manual_values():
+            part = normalize_part(part_var.get())
+            qty_raw = qty_var.get().strip()
+            job = job_var.get().strip()
+            loc = loc_var.get().strip()
+            date_text = date_var.get().strip()
+
+            if not part:
+                raise ValueError("Part Number is required.")
+
+            if not qty_raw:
+                raise ValueError("Quantity is required.")
+
             try:
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".zpl", mode="w", encoding="utf-8") as tmp:
-                    tmp.write(zpl_text)
-                    tmp_path = tmp.name
+                qty_num = int(qty_raw)
+            except ValueError:
+                raise ValueError("Quantity must be a whole number.")
 
-                cmd = ["lp", "-d", printer_name, "-o", "raw", tmp_path]
-                result = subprocess.run(cmd, capture_output=True, text=True)
+            if qty_num <= 0:
+                raise ValueError("Quantity must be greater than 0.")
 
-                if result.returncode != 0:
-                    raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "Unknown lp error")
+            if not date_text:
+                date_text = today_mdy2()
 
-                self.status_var.set(f"Printed {len(tag_rows)} Zebra tag(s) to {printer_name}")
-                messagebox.showinfo("Printed", f"Sent {len(tag_rows)} tag(s) to:\n{printer_name}")
+            return {
+                "part": part,
+                "qty": qty_num,
+                "job": job,
+                "loc": loc,
+                "date": date_text
+            }
 
+        def preview_manual():
+            try:
+                data = build_manual_values()
+                lines = [
+                    "Manual Tag Preview",
+                    "-" * 40,
+                    f"Part: {data['part']}",
+                    f"Qty: {data['qty']}",
+                    f"Job: {data['job']}",
+                    f"Location: {data['loc']}",
+                    f"Date: {data['date']}",
+                ]
+                set_preview("\n".join(lines))
             except Exception as e:
-                messagebox.showerror(
-                    "Print Error",
-                    f"Could not send tags to printer '{printer_name}'.\n\n{e}\n\n"
-                    "Make sure the printer name matches exactly what macOS shows in Printers & Scanners.\n"
-                    "You can still use File → Export Zebra Tags (.zpl)..."
+                set_preview(f"Error:\n{e}")
+
+        def print_manual():
+            try:
+                data = build_manual_values()
+                zpl_text = self.make_zebra_tag_zpl(
+                    part=data["part"],
+                    qty=data["qty"],
+                    job=data["job"],
+                    loc=data["loc"],
+                    date_text=data["date"]
                 )
-            finally:
-                if tmp_path and os.path.exists(tmp_path):
-                    try:
-                        os.remove(tmp_path)
-                    except Exception:
-                        pass
+
+                printer_name = self.ZEBRA_PRINTER_NAME.strip()
+                if not printer_name:
+                    messagebox.showinfo("Printer Not Set", "Set the Zebra printer name in Settings first.")
+                    return
+
+                ok, err = self._send_zpl_to_printer(zpl_text, printer_name)
+                if ok:
+                    self.status_var.set(f"Printed manual tag to {printer_name}")
+                    messagebox.showinfo("Printed", f"Manual tag sent to:\n{printer_name}")
+                    win.destroy()
+                else:
+                    messagebox.showerror(
+                        "Print Error",
+                        f"Could not print manual tag.\n\n{err}"
+                    )
+            except Exception as e:
+                messagebox.showerror("Manual Print Error", str(e))
+
+        def export_manual():
+            try:
+                data = build_manual_values()
+                zpl_text = self.make_zebra_tag_zpl(
+                    part=data["part"],
+                    qty=data["qty"],
+                    job=data["job"],
+                    loc=data["loc"],
+                    date_text=data["date"]
+                )
+
+                path = filedialog.asksaveasfilename(
+                    title="Save Manual Tag",
+                    initialfile=safe_default_filename("Manual_Tag", "zpl"),
+                    defaultextension=".zpl",
+                    filetypes=[("Zebra ZPL files", "*.zpl"), ("Text files", "*.txt"), ("All files", "*.*")]
+                )
+                if not path:
+                    return
+
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(zpl_text)
+
+                self.status_var.set(f"Exported manual tag: {os.path.basename(path)}")
+                messagebox.showinfo("Exported", f"Manual tag saved:\n{path}")
+            except Exception as e:
+                messagebox.showerror("Manual Export Error", str(e))
+
+        btns = ttk.Frame(frm)
+        btns.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+
+        ttk.Button(btns, text="Preview", command=preview_manual).pack(side=tk.LEFT)
+        ttk.Button(btns, text="Export ZPL", command=export_manual).pack(side=tk.RIGHT)
+        ttk.Button(btns, text="Print", command=print_manual).pack(side=tk.RIGHT, padx=(0, 8))
 
     # ---------- Outputs ----------
     def _show_shipment_summary(self, shipment_rows):
@@ -1789,6 +2017,8 @@ class WarehouseApp(tk.Tk):
             "- Paste full pull list directly into app\n"
             "- Combines Job 1 + Job 2 on Zebra tags\n"
             "- Zebra ZT230 tag export / print (Windows + Mac/Linux)\n"
+            "- Manual one-off tag printing\n"
+            "- Pull-plan-based tag printing after apply\n"
         )
 
     # ---------- Tree utils ----------

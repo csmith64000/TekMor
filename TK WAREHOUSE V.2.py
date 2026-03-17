@@ -328,6 +328,7 @@ class WarehouseApp(tk.Tk):
         self.last_warehouse_path = None
         self._last_shortages_df = pd.DataFrame()
         self.last_pull_plan_df = pd.DataFrame()
+        self.manual_tag_rows = []
 
         # Warehouse columns
         self.W_PART = "Part"
@@ -383,7 +384,8 @@ class WarehouseApp(tk.Tk):
         file_menu.add_separator()
         file_menu.add_command(label="Export Zebra Tags (.zpl)...", command=self.export_zebra_tags)
         file_menu.add_command(label="Print Zebra Tags...", command=self.print_zebra_tags)
-        file_menu.add_command(label="Manual Print Tag...", command=self.open_manual_print_window)
+        file_menu.add_command(label="Manual Tag Batch...", command=self.open_manual_print_window)
+        file_menu.add_command(label="Clear Manual Tag Batch", command=self.clear_manual_tag_batch)
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self.destroy)
         menubar.add_cascade(label="File", menu=file_menu)
@@ -434,7 +436,7 @@ class WarehouseApp(tk.Tk):
         ttk.Button(top, text="Load Pull List", command=self.load_pull_list).pack(side=tk.LEFT, padx=6)
         ttk.Button(top, text="Paste Pull List", command=self.open_paste_pull_list_window).pack(side=tk.LEFT, padx=6)
         ttk.Button(top, text="Apply Pull", command=self.apply_pull_list).pack(side=tk.LEFT, padx=6)
-        ttk.Button(top, text="Manual Print Tag", command=self.open_manual_print_window).pack(side=tk.LEFT, padx=6)
+        ttk.Button(top, text="Manual Tag Batch", command=self.open_manual_print_window).pack(side=tk.LEFT, padx=6)
 
         self.status_var = tk.StringVar(value="Load a warehouse CSV to begin.")
         ttk.Label(top, textvariable=self.status_var).pack(side=tk.RIGHT)
@@ -968,6 +970,7 @@ class WarehouseApp(tk.Tk):
 
         if self.DRY_RUN_MODE.get():
             self._post_run_outputs(plan_df, pre_log_df, shortages_df)
+            self.update_tag_preview()
             messagebox.showinfo("Dry Run Complete", "Dry Run mode is ON.\n\nNo inventory was changed.")
             return
 
@@ -1023,6 +1026,7 @@ class WarehouseApp(tk.Tk):
         self.preview_pull_list(summary=self._summarize_batch_log(batch_log))
         self._show_shipment_summary(shipment_rows)
         self._last_shortages_df = shortages_df
+        self.update_tag_preview()
 
         msg = "✅ Pull applied successfully!"
         if backup_path:
@@ -1343,7 +1347,8 @@ class WarehouseApp(tk.Tk):
                 "qty": sent,
                 "job": self._zpl_safe(job_text),
                 "loc": self._zpl_safe(loc_full),
-                "date": run_date
+                "date": run_date,
+                "source": "pull"
             })
 
         return tag_rows
@@ -1414,10 +1419,54 @@ class WarehouseApp(tk.Tk):
                 "qty": sent,
                 "job": self._zpl_safe(job_text),
                 "loc": self._zpl_safe(loc_full),
-                "date": run_date
+                "date": run_date,
+                "source": "pull"
             })
 
         return tag_rows
+
+    def get_all_tag_rows(self):
+        pull_rows = []
+        if self.last_pull_plan_df is not None and not self.last_pull_plan_df.empty:
+            pull_rows = self.build_tag_rows_from_plan(self.last_pull_plan_df)
+        elif self.warehouse_df is not None and self.pull_df is not None:
+            pull_rows = self.build_tag_rows()
+
+        manual_rows = list(self.manual_tag_rows)
+        return pull_rows + manual_rows
+
+    def update_tag_preview(self):
+        all_rows = self.get_all_tag_rows()
+
+        if not all_rows:
+            return
+
+        lines = []
+        lines.append("Tag Batch Preview")
+        lines.append("-" * 40)
+        lines.append(f"Total Tags Queued: {len(all_rows)}")
+        pull_count = sum(1 for r in all_rows if r.get("source") == "pull")
+        manual_count = sum(1 for r in all_rows if r.get("source") == "manual")
+        lines.append(f"Pull Tags: {pull_count}")
+        lines.append(f"Manual Tags: {manual_count}")
+        lines.append("")
+
+        preview_count = min(len(all_rows), 20)
+        for i, row in enumerate(all_rows[:preview_count], start=1):
+            lines.append(
+                f"{i}. [{row.get('source', '').upper()}] "
+                f"PART={row.get('part', '')} | "
+                f"QTY={row.get('qty', '')} | "
+                f"JOB={row.get('job', '')} | "
+                f"LOC={row.get('loc', '')} | "
+                f"DATE={row.get('date', '')}"
+            )
+
+        if len(all_rows) > preview_count:
+            lines.append("")
+            lines.append(f"...and {len(all_rows) - preview_count} more tag(s)")
+
+        self._set_pull_preview("\n".join(lines))
 
     def make_zebra_tag_zpl(self, part, qty, job, loc, date_text):
         part = self._zpl_safe(part)
@@ -1456,10 +1505,7 @@ class WarehouseApp(tk.Tk):
         return zpl.strip() + "\n"
 
     def _build_all_zpl(self):
-        if self.last_pull_plan_df is not None and not self.last_pull_plan_df.empty:
-            tag_rows = self.build_tag_rows_from_plan(self.last_pull_plan_df)
-        else:
-            tag_rows = self.build_tag_rows()
+        tag_rows = self.get_all_tag_rows()
 
         if not tag_rows:
             return "", []
@@ -1528,13 +1574,9 @@ class WarehouseApp(tk.Tk):
                         pass
 
     def export_zebra_tags(self):
-        if self.warehouse_df is None or self.pull_df is None:
-            messagebox.showinfo("Missing Data", "Load warehouse + pull list first.")
-            return
-
         zpl_text, tag_rows = self._build_all_zpl()
         if not zpl_text:
-            messagebox.showinfo("No Tags", "No printable tag rows were generated.\n\nThis usually means nothing was actually sent.")
+            messagebox.showinfo("No Tags", "No tags are queued to export.")
             return
 
         path = filedialog.asksaveasfilename(
@@ -1555,13 +1597,9 @@ class WarehouseApp(tk.Tk):
             messagebox.showerror("Export Error", f"Could not export Zebra tags.\n\n{e}")
 
     def print_zebra_tags(self):
-        if self.warehouse_df is None or self.pull_df is None:
-            messagebox.showinfo("Missing Data", "Load warehouse + pull list first.")
-            return
-
         zpl_text, tag_rows = self._build_all_zpl()
         if not zpl_text:
-            messagebox.showinfo("No Tags", "No printable tag rows were generated.\n\nThis usually means nothing was actually sent.")
+            messagebox.showinfo("No Tags", "No tags are queued to print.")
             return
 
         printer_name = self.ZEBRA_PRINTER_NAME.strip()
@@ -1581,16 +1619,22 @@ class WarehouseApp(tk.Tk):
                 "You can still use File → Export Zebra Tags (.zpl)..."
             )
 
+    def clear_manual_tag_batch(self):
+        self.manual_tag_rows = []
+        self.update_tag_preview()
+        self.status_var.set("Manual tag batch cleared.")
+        messagebox.showinfo("Cleared", "Manual tag batch cleared.")
+
     def open_manual_print_window(self):
         win = tk.Toplevel(self)
-        win.title("Manual Print Tag")
-        win.geometry("560x420")
+        win.title("Manual Tag Batch")
+        win.geometry("620x460")
         win.grab_set()
 
         frm = ttk.Frame(win, padding=16)
         frm.pack(fill=tk.BOTH, expand=True)
 
-        ttk.Label(frm, text="Manual Print Tag", font=("Segoe UI", 12, "bold")).grid(
+        ttk.Label(frm, text="Manual Tag Batch", font=("Segoe UI", 12, "bold")).grid(
             row=0, column=0, columnspan=2, sticky="w", pady=(0, 12)
         )
 
@@ -1654,11 +1698,12 @@ class WarehouseApp(tk.Tk):
                 date_text = today_mdy2()
 
             return {
-                "part": part,
+                "part": self._zpl_safe(part),
                 "qty": qty_num,
-                "job": job,
-                "loc": loc,
-                "date": date_text
+                "job": self._zpl_safe(job),
+                "loc": self._zpl_safe(loc),
+                "date": self._zpl_safe(date_text),
+                "source": "manual"
             }
 
         def preview_manual():
@@ -1677,69 +1722,29 @@ class WarehouseApp(tk.Tk):
             except Exception as e:
                 set_preview(f"Error:\n{e}")
 
-        def print_manual():
+        def add_to_batch():
             try:
                 data = build_manual_values()
-                zpl_text = self.make_zebra_tag_zpl(
-                    part=data["part"],
-                    qty=data["qty"],
-                    job=data["job"],
-                    loc=data["loc"],
-                    date_text=data["date"]
-                )
-
-                printer_name = self.ZEBRA_PRINTER_NAME.strip()
-                if not printer_name:
-                    messagebox.showinfo("Printer Not Set", "Set the Zebra printer name in Settings first.")
-                    return
-
-                ok, err = self._send_zpl_to_printer(zpl_text, printer_name)
-                if ok:
-                    self.status_var.set(f"Printed manual tag to {printer_name}")
-                    messagebox.showinfo("Printed", f"Manual tag sent to:\n{printer_name}")
-                    win.destroy()
-                else:
-                    messagebox.showerror(
-                        "Print Error",
-                        f"Could not print manual tag.\n\n{err}"
-                    )
+                self.manual_tag_rows.append(data)
+                self.update_tag_preview()
+                self.status_var.set(f"Added manual tag for part {data['part']} to batch.")
+                messagebox.showinfo("Added", f"Manual tag added to batch:\n{data['part']}")
+                win.destroy()
             except Exception as e:
-                messagebox.showerror("Manual Print Error", str(e))
+                messagebox.showerror("Add To Batch Error", str(e))
 
-        def export_manual():
-            try:
-                data = build_manual_values()
-                zpl_text = self.make_zebra_tag_zpl(
-                    part=data["part"],
-                    qty=data["qty"],
-                    job=data["job"],
-                    loc=data["loc"],
-                    date_text=data["date"]
-                )
-
-                path = filedialog.asksaveasfilename(
-                    title="Save Manual Tag",
-                    initialfile=safe_default_filename("Manual_Tag", "zpl"),
-                    defaultextension=".zpl",
-                    filetypes=[("Zebra ZPL files", "*.zpl"), ("Text files", "*.txt"), ("All files", "*.*")]
-                )
-                if not path:
-                    return
-
-                with open(path, "w", encoding="utf-8") as f:
-                    f.write(zpl_text)
-
-                self.status_var.set(f"Exported manual tag: {os.path.basename(path)}")
-                messagebox.showinfo("Exported", f"Manual tag saved:\n{path}")
-            except Exception as e:
-                messagebox.showerror("Manual Export Error", str(e))
+        def clear_batch_from_window():
+            self.manual_tag_rows = []
+            self.update_tag_preview()
+            set_preview("Manual tag batch cleared.")
+            self.status_var.set("Manual tag batch cleared.")
 
         btns = ttk.Frame(frm)
         btns.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(8, 0))
 
         ttk.Button(btns, text="Preview", command=preview_manual).pack(side=tk.LEFT)
-        ttk.Button(btns, text="Export ZPL", command=export_manual).pack(side=tk.RIGHT)
-        ttk.Button(btns, text="Print", command=print_manual).pack(side=tk.RIGHT, padx=(0, 8))
+        ttk.Button(btns, text="Clear Manual Batch", command=clear_batch_from_window).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(btns, text="Add To Batch", command=add_to_batch).pack(side=tk.RIGHT)
 
     # ---------- Outputs ----------
     def _show_shipment_summary(self, shipment_rows):
@@ -2017,7 +2022,7 @@ class WarehouseApp(tk.Tk):
             "- Paste full pull list directly into app\n"
             "- Combines Job 1 + Job 2 on Zebra tags\n"
             "- Zebra ZT230 tag export / print (Windows + Mac/Linux)\n"
-            "- Manual one-off tag printing\n"
+            "- Manual batch tag queue\n"
             "- Pull-plan-based tag printing after apply\n"
         )
 

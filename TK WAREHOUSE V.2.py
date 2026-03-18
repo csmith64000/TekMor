@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, simpledialog
 import pandas as pd
 import re
 import math
@@ -19,8 +19,6 @@ def normalize_part(part) -> str:
 
     s = str(part).strip()
 
-    # Remove only spreadsheet-added .0
-    # Example: 001234.0 -> 001234
     if re.fullmatch(r"\d+\.0", s):
         s = s[:-2]
 
@@ -28,13 +26,6 @@ def normalize_part(part) -> str:
 
 
 def parse_qty(q):
-    """
-    Parse quantity:
-    - 6 -> 6
-    - "6 pcs" -> 6
-    - "1 box" -> 1
-    - "ALL" -> token
-    """
     if pd.isna(q):
         return None, "missing"
 
@@ -124,19 +115,6 @@ def split_pasted_line(line: str):
 
 
 def parse_block_record(block):
-    """
-    Expected layout:
-    0  request date
-    1  person
-    2  job 1
-    3  part number
-    4  on hand qty
-    5  room
-    6  location
-    7  pull qty
-    8  due date
-    9  job 2 / destination text
-    """
     block = [clean_cell_value(x) for x in block if clean_cell_value(x) != ""]
 
     if len(block) < 9:
@@ -168,7 +146,6 @@ def parse_block_record(block):
             "Job 2": job2
         }
 
-    # Fallback smart scan
     part_candidates = []
     for i, c in enumerate(block):
         if looks_like_part(c):
@@ -227,11 +204,6 @@ def parse_block_record(block):
 
 
 def parse_pasted_pull_rows(raw_text: str):
-    """
-    Handles BOTH:
-    1. tab-separated row paste from Sheets/Excel
-    2. vertically stacked copied cells
-    """
     output_cols = [
         "REQUEST_DATE", "PERSON", "Job", "PART NUMBER", "ON_HAND_QTY",
         "RM", "Location", "QTY PULLED", "SHIP_DATE", "Job 2"
@@ -240,7 +212,6 @@ def parse_pasted_pull_rows(raw_text: str):
     if not raw_text.strip():
         return pd.DataFrame(columns=output_cols)
 
-    # First try direct row-based parsing from tabs (best for Sheets)
     parsed_rows = []
     for raw_line in raw_text.splitlines():
         line = raw_line.strip()
@@ -254,7 +225,6 @@ def parse_pasted_pull_rows(raw_text: str):
         cols = split_pasted_line(line)
         cols = [clean_cell_value(c) for c in cols if clean_cell_value(c) != ""]
 
-        # Exact 10-column layout from Sheets/email
         if len(cols) >= 10 and looks_like_date(cols[0]):
             record = {
                 "REQUEST_DATE": cols[0],
@@ -272,7 +242,6 @@ def parse_pasted_pull_rows(raw_text: str):
                 parsed_rows.append(record)
                 continue
 
-        # Fallback
         record = parse_block_record(cols)
         if record:
             parsed_rows.append(record)
@@ -280,7 +249,6 @@ def parse_pasted_pull_rows(raw_text: str):
     if parsed_rows:
         return pd.DataFrame(parsed_rows, columns=output_cols)
 
-    # Vertical stacked mode
     raw_lines = [line.rstrip() for line in raw_text.splitlines()]
     lines = [clean_cell_value(x) for x in raw_lines if clean_cell_value(x) != ""]
 
@@ -319,7 +287,7 @@ class WarehouseApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Tekmor Warehouse Tool")
-        self.geometry("1350x780")
+        self.geometry("1380x800")
 
         # Data
         self.warehouse_df = None
@@ -328,7 +296,10 @@ class WarehouseApp(tk.Tk):
         self.last_warehouse_path = None
         self._last_shortages_df = pd.DataFrame()
         self.last_pull_plan_df = pd.DataFrame()
+
+        # Tag sources
         self.manual_tag_rows = []
+        self.batch_override_rows = None  # edited/final queue used for print/export when present
 
         # Warehouse columns
         self.W_PART = "Part"
@@ -336,6 +307,8 @@ class WarehouseApp(tk.Tk):
         self.W_DATE_MAIN = "Date"
         self.W_DATE = "Last Updated"
         self.W_INOUT = "In/Out"
+        self.W_RM = "RM"
+        self.W_LOC = "Location"
 
         # Auto rename old comments column
         self.AUTO_RENAME_COMMENTS_TO_INOUT = True
@@ -345,7 +318,7 @@ class WarehouseApp(tk.Tk):
         self.P_PART = "PART NUMBER"
         self.P_QTY = "QTY PULLED"
 
-        # Zebra / pull optional columns
+        # Pull optional columns
         self.P_JOB = "Job"
         self.P_JOB2 = "Job 2"
         self.P_RM = "RM"
@@ -382,9 +355,9 @@ class WarehouseApp(tk.Tk):
         file_menu.add_command(label="Export Log As...", command=self.export_log)
         file_menu.add_command(label="Export Shortages As...", command=self.export_shortages)
         file_menu.add_separator()
+        file_menu.add_command(label="Open Tag Batch Manager...", command=self.open_tag_batch_manager)
         file_menu.add_command(label="Export Zebra Tags (.zpl)...", command=self.export_zebra_tags)
         file_menu.add_command(label="Print Zebra Tags...", command=self.print_zebra_tags)
-        file_menu.add_command(label="Manual Tag Batch...", command=self.open_manual_print_window)
         file_menu.add_command(label="Clear Manual Tag Batch", command=self.clear_manual_tag_batch)
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self.destroy)
@@ -436,7 +409,7 @@ class WarehouseApp(tk.Tk):
         ttk.Button(top, text="Load Pull List", command=self.load_pull_list).pack(side=tk.LEFT, padx=6)
         ttk.Button(top, text="Paste Pull List", command=self.open_paste_pull_list_window).pack(side=tk.LEFT, padx=6)
         ttk.Button(top, text="Apply Pull", command=self.apply_pull_list).pack(side=tk.LEFT, padx=6)
-        ttk.Button(top, text="Manual Tag Batch", command=self.open_manual_print_window).pack(side=tk.LEFT, padx=6)
+        ttk.Button(top, text="Tag Batch Manager", command=self.open_tag_batch_manager).pack(side=tk.LEFT, padx=6)
 
         self.status_var = tk.StringVar(value="Load a warehouse CSV to begin.")
         ttk.Label(top, textvariable=self.status_var).pack(side=tk.RIGHT)
@@ -444,7 +417,7 @@ class WarehouseApp(tk.Tk):
         main = ttk.Frame(self, padding=(10, 0, 10, 10))
         main.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
-        left = ttk.Frame(main, width=450)
+        left = ttk.Frame(main, width=460)
         left.pack(side=tk.LEFT, fill=tk.Y)
 
         ttk.Label(left, text="Part Details", font=("Segoe UI", 12, "bold")).pack(anchor="w", pady=(0, 8))
@@ -457,8 +430,8 @@ class WarehouseApp(tk.Tk):
         self.shipment_text.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
         self.shipment_text.configure(state="disabled")
 
-        ttk.Label(left, text="Pull List Preview", font=("Segoe UI", 12, "bold")).pack(anchor="w", pady=(0, 8))
-        self.pull_preview = tk.Text(left, height=10, wrap="word")
+        ttk.Label(left, text="Preview / Tag Queue", font=("Segoe UI", 12, "bold")).pack(anchor="w", pady=(0, 8))
+        self.pull_preview = tk.Text(left, height=12, wrap="word")
         self.pull_preview.pack(fill=tk.BOTH, expand=True)
         self.pull_preview.configure(state="disabled")
 
@@ -529,7 +502,7 @@ class WarehouseApp(tk.Tk):
         if self.W_QTY in df.columns:
             df[self.W_QTY] = pd.to_numeric(df[self.W_QTY], errors="coerce").fillna(0).astype(int)
 
-        for col in (self.W_DATE_MAIN, self.W_DATE, self.W_INOUT):
+        for col in (self.W_DATE_MAIN, self.W_DATE, self.W_INOUT, self.W_RM, self.W_LOC):
             if col not in df.columns:
                 df[col] = ""
 
@@ -537,6 +510,8 @@ class WarehouseApp(tk.Tk):
         self._clear_tree()
         self.refresh_inventory_view()
         self.status_var.set(f"Warehouse loaded: {os.path.basename(path)}")
+        self.reset_batch_override()
+        self.update_tag_preview()
 
     def load_pull_list(self):
         path = filedialog.askopenfilename(
@@ -559,6 +534,8 @@ class WarehouseApp(tk.Tk):
         self.pull_df = df
         self.preview_pull_list()
         self.status_var.set(f"Pull list loaded: {os.path.basename(path)}")
+        self.reset_batch_override()
+        self.update_tag_preview()
 
     def open_paste_pull_list_window(self):
         win = tk.Toplevel(self)
@@ -611,6 +588,8 @@ class WarehouseApp(tk.Tk):
 
                 preview_label.config(text=f"Loaded {len(df)} rows from pasted data.")
                 self.status_var.set(f"Pasted pull list loaded ({len(df)} rows).")
+                self.reset_batch_override()
+                self.update_tag_preview()
                 messagebox.showinfo("Loaded", f"Pasted pull list loaded successfully.\nRows: {len(df)}")
                 win.destroy()
 
@@ -653,6 +632,17 @@ class WarehouseApp(tk.Tk):
             if idx < len(vals):
                 return normalize_part(vals[idx])
         return ""
+
+    def _get_warehouse_row_by_part(self, part: str):
+        if self.warehouse_df is None:
+            return None
+        idx = self._get_part_index(part)
+        if idx is None:
+            return None
+        try:
+            return self.warehouse_df.loc[idx]
+        except Exception:
+            return None
 
     # ---------- Pull planning ----------
     def build_pull_plan(self):
@@ -970,6 +960,7 @@ class WarehouseApp(tk.Tk):
 
         if self.DRY_RUN_MODE.get():
             self._post_run_outputs(plan_df, pre_log_df, shortages_df)
+            self.reset_batch_override()
             self.update_tag_preview()
             messagebox.showinfo("Dry Run Complete", "Dry Run mode is ON.\n\nNo inventory was changed.")
             return
@@ -1026,6 +1017,7 @@ class WarehouseApp(tk.Tk):
         self.preview_pull_list(summary=self._summarize_batch_log(batch_log))
         self._show_shipment_summary(shipment_rows)
         self._last_shortages_df = shortages_df
+        self.reset_batch_override()
         self.update_tag_preview()
 
         msg = "✅ Pull applied successfully!"
@@ -1253,7 +1245,7 @@ class WarehouseApp(tk.Tk):
 
         part_entry.focus_set()
 
-    # ---------- Zebra tags ----------
+    # ---------- Zebra / tag helpers ----------
     def _zpl_safe(self, value):
         if value is None:
             return ""
@@ -1285,79 +1277,36 @@ class WarehouseApp(tk.Tk):
             return job2
         return ""
 
-    def build_tag_rows(self):
-        """
-        Legacy fallback: builds tags from current warehouse state.
-        Prefer build_tag_rows_from_plan() whenever possible.
-        """
-        if self.warehouse_df is None or self.pull_df is None:
-            return []
+    def _warehouse_loc_text_for_part(self, part: str):
+        wh_row = self._get_warehouse_row_by_part(part)
+        if wh_row is None:
+            return ""
 
-        wh = self.warehouse_df
-        pull = self.pull_df.copy()
+        rm = ""
+        loc = ""
 
-        wh_index = {}
-        for idx, part in wh[self.W_PART].items():
-            if part and part not in wh_index:
-                wh_index[part] = idx
+        if self.W_RM in wh_row.index:
+            rm = "" if pd.isna(wh_row[self.W_RM]) else str(wh_row[self.W_RM]).strip()
 
-        remaining = {}
-        for idx, part in wh[self.W_PART].items():
-            remaining[part] = int(wh.at[idx, self.W_QTY])
+        if self.W_LOC in wh_row.index:
+            loc = "" if pd.isna(wh_row[self.W_LOC]) else str(wh_row[self.W_LOC]).strip()
 
-        tag_rows = []
-        run_date = today_mdy2()
+        return " ".join([x for x in [rm, loc] if x and x.lower() != "nan"]).strip()
 
-        for _, row in pull.iterrows():
-            part = normalize_part(self._pull_value(row, self.P_PART, self.P_COL_PART_IDX))
-            qty_raw = self._pull_value(row, self.P_QTY, self.P_COL_QTY_IDX)
+    def _make_tag_row(self, part, qty, job, loc, date_text, source):
+        return {
+            "part": self._zpl_safe(part),
+            "qty": int(qty),
+            "job": self._zpl_safe(job),
+            "loc": self._zpl_safe(loc),
+            "date": self._zpl_safe(date_text),
+            "source": source
+        }
 
-            if not part:
-                continue
-
-            qty, _ = parse_qty(qty_raw)
-            if qty is None:
-                continue
-
-            if part not in wh_index:
-                continue
-
-            before = remaining.get(part, 0)
-            requested = before if qty == "ALL" else int(qty)
-            sent = min(before, requested)
-            after = before - sent
-            remaining[part] = after
-
-            if sent <= 0:
-                continue
-
-            job1 = self._pull_value(row, self.P_JOB, self.P_COL_JOB_IDX)
-            job2 = self._pull_value(row, self.P_JOB2, self.P_COL_JOB2_IDX)
-            rm = self._pull_value(row, self.P_RM, self.P_COL_RM_IDX)
-            loc = self._pull_value(row, self.P_LOC, self.P_COL_LOC_IDX)
-
-            rm = "" if pd.isna(rm) else str(rm).strip()
-            loc = "" if pd.isna(loc) else str(loc).strip()
-
-            job_text = self._combine_job_text(job1, job2)
-            loc_full = " ".join([x for x in [rm, loc] if x and x.lower() != "nan"]).strip()
-
-            tag_rows.append({
-                "part": self._zpl_safe(part),
-                "qty": sent,
-                "job": self._zpl_safe(job_text),
-                "loc": self._zpl_safe(loc_full),
-                "date": run_date,
-                "source": "pull"
-            })
-
-        return tag_rows
+    def reset_batch_override(self):
+        self.batch_override_rows = None
 
     def build_tag_rows_from_plan(self, plan_df=None):
-        """
-        Build tags from the actual last pull plan so printing still works
-        after inventory has already been updated.
-        """
         if self.pull_df is None:
             return []
 
@@ -1389,15 +1338,10 @@ class WarehouseApp(tk.Tk):
 
             qty_raw = self._pull_value(row, self.P_QTY, self.P_COL_QTY_IDX)
             qty, _ = parse_qty(qty_raw)
-
             if qty is None:
                 continue
 
-            if qty == "ALL":
-                sent = qty_left_for_part
-            else:
-                sent = min(int(qty), qty_left_for_part)
-
+            sent = qty_left_for_part if qty == "ALL" else min(int(qty), qty_left_for_part)
             if sent <= 0:
                 continue
 
@@ -1405,40 +1349,51 @@ class WarehouseApp(tk.Tk):
 
             job1 = self._pull_value(row, self.P_JOB, self.P_COL_JOB_IDX)
             job2 = self._pull_value(row, self.P_JOB2, self.P_COL_JOB2_IDX)
-            rm = self._pull_value(row, self.P_RM, self.P_COL_RM_IDX)
-            loc = self._pull_value(row, self.P_LOC, self.P_COL_LOC_IDX)
-
-            rm = "" if pd.isna(rm) else str(rm).strip()
-            loc = "" if pd.isna(loc) else str(loc).strip()
-
             job_text = self._combine_job_text(job1, job2)
-            loc_full = " ".join([x for x in [rm, loc] if x and x.lower() != "nan"]).strip()
 
-            tag_rows.append({
-                "part": self._zpl_safe(part),
-                "qty": sent,
-                "job": self._zpl_safe(job_text),
-                "loc": self._zpl_safe(loc_full),
-                "date": run_date,
-                "source": "pull"
-            })
+            # IMPORTANT: location comes from warehouse file first
+            loc_full = self._warehouse_loc_text_for_part(part)
+
+            # fallback if warehouse location missing
+            if not loc_full:
+                rm = self._pull_value(row, self.P_RM, self.P_COL_RM_IDX)
+                loc = self._pull_value(row, self.P_LOC, self.P_COL_LOC_IDX)
+                rm = "" if pd.isna(rm) else str(rm).strip()
+                loc = "" if pd.isna(loc) else str(loc).strip()
+                loc_full = " ".join([x for x in [rm, loc] if x and x.lower() != "nan"]).strip()
+
+            tag_rows.append(self._make_tag_row(
+                part=part,
+                qty=sent,
+                job=job_text,
+                loc=loc_full,
+                date_text=run_date,
+                source="pull"
+            ))
 
         return tag_rows
 
-    def get_all_tag_rows(self):
+    def get_source_tag_rows(self):
         pull_rows = []
         if self.last_pull_plan_df is not None and not self.last_pull_plan_df.empty:
             pull_rows = self.build_tag_rows_from_plan(self.last_pull_plan_df)
-        elif self.warehouse_df is not None and self.pull_df is not None:
-            pull_rows = self.build_tag_rows()
 
-        manual_rows = list(self.manual_tag_rows)
+        manual_rows = [dict(r) for r in self.manual_tag_rows]
         return pull_rows + manual_rows
 
+    def get_current_batch_rows(self):
+        if self.batch_override_rows is not None:
+            return [dict(r) for r in self.batch_override_rows]
+        return self.get_source_tag_rows()
+
     def update_tag_preview(self):
-        all_rows = self.get_all_tag_rows()
+        all_rows = self.get_current_batch_rows()
 
         if not all_rows:
+            if self.pull_df is not None:
+                self.preview_pull_list()
+            else:
+                self._set_pull_preview("No pull list or tags queued.")
             return
 
         lines = []
@@ -1447,8 +1402,10 @@ class WarehouseApp(tk.Tk):
         lines.append(f"Total Tags Queued: {len(all_rows)}")
         pull_count = sum(1 for r in all_rows if r.get("source") == "pull")
         manual_count = sum(1 for r in all_rows if r.get("source") == "manual")
+        edited_count = sum(1 for r in all_rows if r.get("source") == "edited")
         lines.append(f"Pull Tags: {pull_count}")
         lines.append(f"Manual Tags: {manual_count}")
+        lines.append(f"Edited Tags: {edited_count}")
         lines.append("")
 
         preview_count = min(len(all_rows), 20)
@@ -1505,8 +1462,7 @@ class WarehouseApp(tk.Tk):
         return zpl.strip() + "\n"
 
     def _build_all_zpl(self):
-        tag_rows = self.get_all_tag_rows()
-
+        tag_rows = self.get_current_batch_rows()
         if not tag_rows:
             return "", []
 
@@ -1573,6 +1529,7 @@ class WarehouseApp(tk.Tk):
                     except Exception:
                         pass
 
+    # ---------- Print/export ----------
     def export_zebra_tags(self):
         zpl_text, tag_rows = self._build_all_zpl()
         if not zpl_text:
@@ -1619,132 +1576,237 @@ class WarehouseApp(tk.Tk):
                 "You can still use File → Export Zebra Tags (.zpl)..."
             )
 
+    # ---------- Manual tag source management ----------
     def clear_manual_tag_batch(self):
         self.manual_tag_rows = []
+        self.reset_batch_override()
         self.update_tag_preview()
         self.status_var.set("Manual tag batch cleared.")
         messagebox.showinfo("Cleared", "Manual tag batch cleared.")
 
-    def open_manual_print_window(self):
+    def _manual_tag_dialog(self, initial=None):
+        result = {}
+
         win = tk.Toplevel(self)
-        win.title("Manual Tag Batch")
-        win.geometry("620x460")
+        win.title("Manual Tag")
+        win.geometry("500x320")
         win.grab_set()
 
         frm = ttk.Frame(win, padding=16)
         frm.pack(fill=tk.BOTH, expand=True)
 
-        ttk.Label(frm, text="Manual Tag Batch", font=("Segoe UI", 12, "bold")).grid(
+        ttk.Label(frm, text="Manual Tag", font=("Segoe UI", 12, "bold")).grid(
             row=0, column=0, columnspan=2, sticky="w", pady=(0, 12)
         )
 
+        initial = initial or {}
+
         ttk.Label(frm, text="Part Number:").grid(row=1, column=0, sticky="w", pady=4)
-        part_var = tk.StringVar()
-        selected_part = self._get_selected_part() or normalize_part(self.search_var.get())
-        part_var.set(selected_part)
+        part_var = tk.StringVar(value=initial.get("part", self._get_selected_part() or normalize_part(self.search_var.get())))
         ttk.Entry(frm, textvariable=part_var).grid(row=1, column=1, sticky="ew", pady=4)
 
         ttk.Label(frm, text="Quantity:").grid(row=2, column=0, sticky="w", pady=4)
-        qty_var = tk.StringVar(value="1")
+        qty_var = tk.StringVar(value=str(initial.get("qty", 1)))
         ttk.Entry(frm, textvariable=qty_var).grid(row=2, column=1, sticky="ew", pady=4)
 
         ttk.Label(frm, text="Job:").grid(row=3, column=0, sticky="w", pady=4)
-        job_var = tk.StringVar()
+        job_var = tk.StringVar(value=initial.get("job", ""))
         ttk.Entry(frm, textvariable=job_var).grid(row=3, column=1, sticky="ew", pady=4)
 
         ttk.Label(frm, text="Location:").grid(row=4, column=0, sticky="w", pady=4)
-        loc_var = tk.StringVar()
+        loc_var = tk.StringVar(value=initial.get("loc", ""))
         ttk.Entry(frm, textvariable=loc_var).grid(row=4, column=1, sticky="ew", pady=4)
 
         ttk.Label(frm, text="Date:").grid(row=5, column=0, sticky="w", pady=4)
-        date_var = tk.StringVar(value=today_mdy2())
+        date_var = tk.StringVar(value=initial.get("date", today_mdy2()))
         ttk.Entry(frm, textvariable=date_var).grid(row=5, column=1, sticky="ew", pady=4)
 
-        preview_text = tk.Text(frm, height=10, wrap="word")
-        preview_text.grid(row=6, column=0, columnspan=2, sticky="nsew", pady=(12, 8))
-        preview_text.configure(state="disabled")
-
         frm.columnconfigure(1, weight=1)
-        frm.rowconfigure(6, weight=1)
 
-        def set_preview(text):
-            preview_text.configure(state="normal")
-            preview_text.delete("1.0", tk.END)
-            preview_text.insert(tk.END, text)
-            preview_text.configure(state="disabled")
-
-        def build_manual_values():
-            part = normalize_part(part_var.get())
-            qty_raw = qty_var.get().strip()
-            job = job_var.get().strip()
-            loc = loc_var.get().strip()
-            date_text = date_var.get().strip()
-
-            if not part:
-                raise ValueError("Part Number is required.")
-
-            if not qty_raw:
-                raise ValueError("Quantity is required.")
-
+        def save_now():
             try:
-                qty_num = int(qty_raw)
-            except ValueError:
-                raise ValueError("Quantity must be a whole number.")
+                part = normalize_part(part_var.get())
+                qty = int(qty_var.get().strip())
+                job = job_var.get().strip()
+                loc = loc_var.get().strip()
+                date_text = date_var.get().strip() or today_mdy2()
 
-            if qty_num <= 0:
-                raise ValueError("Quantity must be greater than 0.")
+                if not part:
+                    raise ValueError("Part Number is required.")
+                if qty <= 0:
+                    raise ValueError("Quantity must be greater than 0.")
 
-            if not date_text:
-                date_text = today_mdy2()
-
-            return {
-                "part": self._zpl_safe(part),
-                "qty": qty_num,
-                "job": self._zpl_safe(job),
-                "loc": self._zpl_safe(loc),
-                "date": self._zpl_safe(date_text),
-                "source": "manual"
-            }
-
-        def preview_manual():
-            try:
-                data = build_manual_values()
-                lines = [
-                    "Manual Tag Preview",
-                    "-" * 40,
-                    f"Part: {data['part']}",
-                    f"Qty: {data['qty']}",
-                    f"Job: {data['job']}",
-                    f"Location: {data['loc']}",
-                    f"Date: {data['date']}",
-                ]
-                set_preview("\n".join(lines))
-            except Exception as e:
-                set_preview(f"Error:\n{e}")
-
-        def add_to_batch():
-            try:
-                data = build_manual_values()
-                self.manual_tag_rows.append(data)
-                self.update_tag_preview()
-                self.status_var.set(f"Added manual tag for part {data['part']} to batch.")
-                messagebox.showinfo("Added", f"Manual tag added to batch:\n{data['part']}")
+                result["row"] = self._make_tag_row(
+                    part=part,
+                    qty=qty,
+                    job=job,
+                    loc=loc,
+                    date_text=date_text,
+                    source="manual"
+                )
                 win.destroy()
             except Exception as e:
-                messagebox.showerror("Add To Batch Error", str(e))
-
-        def clear_batch_from_window():
-            self.manual_tag_rows = []
-            self.update_tag_preview()
-            set_preview("Manual tag batch cleared.")
-            self.status_var.set("Manual tag batch cleared.")
+                messagebox.showerror("Manual Tag Error", str(e))
 
         btns = ttk.Frame(frm)
-        btns.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        btns.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(18, 0))
+        ttk.Button(btns, text="Save", command=save_now).pack(side=tk.RIGHT)
+        ttk.Button(btns, text="Cancel", command=win.destroy).pack(side=tk.RIGHT, padx=(0, 8))
 
-        ttk.Button(btns, text="Preview", command=preview_manual).pack(side=tk.LEFT)
-        ttk.Button(btns, text="Clear Manual Batch", command=clear_batch_from_window).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Button(btns, text="Add To Batch", command=add_to_batch).pack(side=tk.RIGHT)
+        win.wait_window()
+        return result.get("row")
+
+    # ---------- Tag batch manager ----------
+    def open_tag_batch_manager(self):
+        win = tk.Toplevel(self)
+        win.title("Tag Batch Manager")
+        win.geometry("1040x620")
+        win.grab_set()
+
+        batch_rows = self.get_current_batch_rows()
+
+        outer = ttk.Frame(win, padding=12)
+        outer.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(
+            outer,
+            text="Review, edit, and print the exact tag batch.",
+            font=("Segoe UI", 11, "bold")
+        ).pack(anchor="w", pady=(0, 10))
+
+        columns = ("source", "part", "qty", "job", "loc", "date")
+        tree = ttk.Treeview(outer, columns=columns, show="headings")
+        tree.pack(fill=tk.BOTH, expand=True)
+
+        headings = {
+            "source": "SOURCE",
+            "part": "PART",
+            "qty": "QTY",
+            "job": "JOB",
+            "loc": "LOCATION",
+            "date": "DATE"
+        }
+
+        for c in columns:
+            tree.heading(c, text=headings[c])
+            width = 120
+            if c == "job":
+                width = 230
+            elif c == "loc":
+                width = 180
+            elif c == "part":
+                width = 160
+            tree.column(c, width=width, stretch=True)
+
+        def refresh_tree():
+            tree.delete(*tree.get_children())
+            for i, row in enumerate(batch_rows):
+                tree.insert("", "end", iid=str(i), values=(
+                    row.get("source", ""),
+                    row.get("part", ""),
+                    row.get("qty", ""),
+                    row.get("job", ""),
+                    row.get("loc", ""),
+                    row.get("date", "")
+                ))
+            total_var.set(f"Total tags in batch: {len(batch_rows)}")
+
+        def selected_index():
+            sel = tree.selection()
+            if not sel:
+                return None
+            try:
+                return int(sel[0])
+            except Exception:
+                return None
+
+        def mark_override():
+            self.batch_override_rows = [dict(r) for r in batch_rows]
+            self.update_tag_preview()
+
+        def add_manual():
+            row = self._manual_tag_dialog()
+            if row:
+                batch_rows.append(row)
+                self.manual_tag_rows.append(dict(row))
+                mark_override()
+                refresh_tree()
+
+        def edit_selected():
+            idx = selected_index()
+            if idx is None:
+                messagebox.showinfo("No Selection", "Select a tag row first.")
+                return
+
+            row = dict(batch_rows[idx])
+            edited = self._manual_tag_dialog(initial=row)
+            if edited:
+                # keep source visible as edited when modifying an existing pull/manual row
+                if row.get("source") != "manual":
+                    edited["source"] = "edited"
+                else:
+                    edited["source"] = "manual"
+
+                batch_rows[idx] = edited
+                mark_override()
+                refresh_tree()
+
+        def delete_selected():
+            idx = selected_index()
+            if idx is None:
+                messagebox.showinfo("No Selection", "Select a tag row first.")
+                return
+
+            part = batch_rows[idx].get("part", "")
+            del batch_rows[idx]
+            mark_override()
+            refresh_tree()
+            self.status_var.set(f"Deleted tag for part {part} from current batch.")
+
+        def clear_manual_only():
+            self.manual_tag_rows = []
+            self.reset_batch_override()
+            nonlocal batch_rows
+            batch_rows = self.get_current_batch_rows()
+            refresh_tree()
+            self.update_tag_preview()
+
+        def refresh_from_sources():
+            self.reset_batch_override()
+            nonlocal batch_rows
+            batch_rows = self.get_current_batch_rows()
+            refresh_tree()
+            self.update_tag_preview()
+
+        def export_current():
+            self.batch_override_rows = [dict(r) for r in batch_rows]
+            self.update_tag_preview()
+            self.export_zebra_tags()
+
+        def print_current():
+            self.batch_override_rows = [dict(r) for r in batch_rows]
+            self.update_tag_preview()
+            self.print_zebra_tags()
+
+        total_var = tk.StringVar()
+        ttk.Label(outer, textvariable=total_var).pack(anchor="w", pady=(10, 8))
+
+        btns = ttk.Frame(outer)
+        btns.pack(fill=tk.X)
+
+        ttk.Button(btns, text="Add Manual Tag", command=add_manual).pack(side=tk.LEFT)
+        ttk.Button(btns, text="Edit Selected", command=edit_selected).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(btns, text="Delete Selected", command=delete_selected).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(btns, text="Clear Manual Tags", command=clear_manual_only).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(btns, text="Refresh From Sources", command=refresh_from_sources).pack(side=tk.LEFT, padx=(8, 0))
+
+        right_btns = ttk.Frame(outer)
+        right_btns.pack(fill=tk.X, pady=(10, 0))
+
+        ttk.Button(right_btns, text="Export Batch", command=export_current).pack(side=tk.RIGHT)
+        ttk.Button(right_btns, text="Print Batch", command=print_current).pack(side=tk.RIGHT, padx=(0, 8))
+
+        refresh_tree()
 
     # ---------- Outputs ----------
     def _show_shipment_summary(self, shipment_rows):
@@ -1795,6 +1857,7 @@ class WarehouseApp(tk.Tk):
             "manual_send": int(counts.get("manual_send", 0)),
         }
 
+    # ---------- Save/export ----------
     def save_updated_warehouse(self):
         if self.warehouse_df is None:
             messagebox.showinfo("No Data", "Nothing to save. Load a warehouse file first.")
@@ -1923,7 +1986,7 @@ class WarehouseApp(tk.Tk):
     def open_settings(self):
         win = tk.Toplevel(self)
         win.title("Settings")
-        win.geometry("650x650")
+        win.geometry("700x720")
         win.grab_set()
 
         frm = ttk.Frame(win, padding=12)
@@ -1953,37 +2016,43 @@ class WarehouseApp(tk.Tk):
         w_inout = tk.StringVar(value=self.W_INOUT)
         ttk.Entry(frm, textvariable=w_inout).grid(row=5, column=1, sticky="ew")
 
-        ttk.Separator(frm).grid(row=6, column=0, columnspan=2, sticky="ew", pady=12)
+        ttk.Label(frm, text="Warehouse RM Column:").grid(row=6, column=0, sticky="w")
+        w_rm = tk.StringVar(value=self.W_RM)
+        ttk.Entry(frm, textvariable=w_rm).grid(row=6, column=1, sticky="ew")
 
-        ttk.Label(frm, text="Pull Part Column:").grid(row=7, column=0, sticky="w")
+        ttk.Label(frm, text="Warehouse Location Column:").grid(row=7, column=0, sticky="w")
+        w_loc = tk.StringVar(value=self.W_LOC)
+        ttk.Entry(frm, textvariable=w_loc).grid(row=7, column=1, sticky="ew")
+
+        ttk.Separator(frm).grid(row=8, column=0, columnspan=2, sticky="ew", pady=12)
+
+        ttk.Label(frm, text="Pull Part Column:").grid(row=9, column=0, sticky="w")
         p_part = tk.StringVar(value=self.P_PART)
-        ttk.Entry(frm, textvariable=p_part).grid(row=7, column=1, sticky="ew")
+        ttk.Entry(frm, textvariable=p_part).grid(row=9, column=1, sticky="ew")
 
-        ttk.Label(frm, text="Pull Qty Column:").grid(row=8, column=0, sticky="w")
+        ttk.Label(frm, text="Pull Qty Column:").grid(row=10, column=0, sticky="w")
         p_qty = tk.StringVar(value=self.P_QTY)
-        ttk.Entry(frm, textvariable=p_qty).grid(row=8, column=1, sticky="ew")
+        ttk.Entry(frm, textvariable=p_qty).grid(row=10, column=1, sticky="ew")
 
-        ttk.Separator(frm).grid(row=9, column=0, columnspan=2, sticky="ew", pady=12)
-
-        ttk.Label(frm, text="Pull Job 1 Column:").grid(row=10, column=0, sticky="w")
+        ttk.Label(frm, text="Pull Job 1 Column:").grid(row=11, column=0, sticky="w")
         p_job = tk.StringVar(value=self.P_JOB)
-        ttk.Entry(frm, textvariable=p_job).grid(row=10, column=1, sticky="ew")
+        ttk.Entry(frm, textvariable=p_job).grid(row=11, column=1, sticky="ew")
 
-        ttk.Label(frm, text="Pull Job 2 Column:").grid(row=11, column=0, sticky="w")
+        ttk.Label(frm, text="Pull Job 2 Column:").grid(row=12, column=0, sticky="w")
         p_job2 = tk.StringVar(value=self.P_JOB2)
-        ttk.Entry(frm, textvariable=p_job2).grid(row=11, column=1, sticky="ew")
+        ttk.Entry(frm, textvariable=p_job2).grid(row=12, column=1, sticky="ew")
 
-        ttk.Label(frm, text="Pull RM Column:").grid(row=12, column=0, sticky="w")
+        ttk.Label(frm, text="Pull RM Column (fallback only):").grid(row=13, column=0, sticky="w")
         p_rm = tk.StringVar(value=self.P_RM)
-        ttk.Entry(frm, textvariable=p_rm).grid(row=12, column=1, sticky="ew")
+        ttk.Entry(frm, textvariable=p_rm).grid(row=13, column=1, sticky="ew")
 
-        ttk.Label(frm, text="Pull Location Column:").grid(row=13, column=0, sticky="w")
+        ttk.Label(frm, text="Pull Location Column (fallback only):").grid(row=14, column=0, sticky="w")
         p_loc = tk.StringVar(value=self.P_LOC)
-        ttk.Entry(frm, textvariable=p_loc).grid(row=13, column=1, sticky="ew")
+        ttk.Entry(frm, textvariable=p_loc).grid(row=14, column=1, sticky="ew")
 
-        ttk.Label(frm, text="Zebra Printer Name:").grid(row=14, column=0, sticky="w")
+        ttk.Label(frm, text="Zebra Printer Name:").grid(row=15, column=0, sticky="w")
         zebra_name = tk.StringVar(value=self.ZEBRA_PRINTER_NAME)
-        ttk.Entry(frm, textvariable=zebra_name).grid(row=14, column=1, sticky="ew")
+        ttk.Entry(frm, textvariable=zebra_name).grid(row=15, column=1, sticky="ew")
 
         frm.columnconfigure(1, weight=1)
 
@@ -1993,6 +2062,8 @@ class WarehouseApp(tk.Tk):
             self.W_DATE_MAIN = w_date_main.get().strip()
             self.W_DATE = w_date.get().strip()
             self.W_INOUT = w_inout.get().strip()
+            self.W_RM = w_rm.get().strip()
+            self.W_LOC = w_loc.get().strip()
 
             self.P_PART = p_part.get().strip()
             self.P_QTY = p_qty.get().strip()
@@ -2003,10 +2074,12 @@ class WarehouseApp(tk.Tk):
             self.ZEBRA_PRINTER_NAME = zebra_name.get().strip()
 
             messagebox.showinfo("Saved", "Settings updated.")
+            self.reset_batch_override()
+            self.update_tag_preview()
             win.destroy()
 
-        ttk.Button(frm, text="Save", command=save_settings).grid(row=15, column=0, pady=14, sticky="w")
-        ttk.Button(frm, text="Cancel", command=win.destroy).grid(row=15, column=1, pady=14, sticky="e")
+        ttk.Button(frm, text="Save", command=save_settings).grid(row=16, column=0, pady=14, sticky="w")
+        ttk.Button(frm, text="Cancel", command=win.destroy).grid(row=16, column=1, pady=14, sticky="e")
 
     def about(self):
         messagebox.showinfo(
@@ -2020,9 +2093,9 @@ class WarehouseApp(tk.Tk):
             "- Manual Send (-)\n"
             "- Dry Run / backups / logs / shortages\n"
             "- Paste full pull list directly into app\n"
-            "- Combines Job 1 + Job 2 on Zebra tags\n"
+            "- Pull tag location uses warehouse file\n"
+            "- Tag batch manager with add/edit/delete\n"
             "- Zebra ZT230 tag export / print (Windows + Mac/Linux)\n"
-            "- Manual batch tag queue\n"
             "- Pull-plan-based tag printing after apply\n"
         )
 

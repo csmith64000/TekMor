@@ -1,3 +1,10 @@
+
+def is_hvwk(value):
+    try:
+        return "HVWK" in str(value).upper()
+    except:
+        return False
+
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 import pandas as pd
@@ -22,6 +29,8 @@ def normalize_part(part) -> str:
     if re.fullmatch(r"\d+\.0", s):
         s = s[:-2]
 
+    s = s.replace(" ", "")
+    s = s.upper()
     return s
 
 
@@ -41,6 +50,39 @@ def parse_qty(q):
         return int(m.group(0)), "number_in_text"
 
     return None, "unparsed"
+
+
+def format_tag_qty(qty_raw, sent_qty):
+    if sent_qty is None:
+        return ""
+
+    if qty_raw is None or (isinstance(qty_raw, float) and math.isnan(qty_raw)):
+        return str(sent_qty)
+
+    s = str(qty_raw).strip()
+    if not s:
+        return str(sent_qty)
+
+    if str(sent_qty).lower() == "all":
+        return s.upper() if s.strip().lower() in ("all", "everything") else s
+
+    m = re.search(r"-?\d+", s)
+    if not m:
+        return str(sent_qty)
+
+    try:
+        parsed_num = int(m.group(0))
+    except Exception:
+        return str(sent_qty)
+
+    if parsed_num != int(sent_qty):
+        return str(sent_qty)
+
+    remainder = (s[:m.start()] + s[m.end():]).strip()
+    if remainder:
+        return f"{sent_qty} {remainder}"
+
+    return str(sent_qty)
 
 
 def today_mdy2() -> str:
@@ -161,7 +203,7 @@ def parse_block_record(block):
     if not part_candidates:
         return None
 
-    part_candidates.sort(key=lambda x: (x[0], x[1]))
+    part_candidates# removed sorting to preserve pull order)
     _, best_idx, best_part = part_candidates[-1]
     part = normalize_part(best_part)
 
@@ -202,6 +244,42 @@ def parse_block_record(block):
         "Job 2": job2
     }
 
+
+
+
+def force_text_export_value(v):
+    if pd.isna(v):
+        return ""
+
+    s = str(v).strip()
+
+    # Remove spreadsheet-added .0 only for fully numeric values
+    if re.fullmatch(r"\d+\.0", s):
+        s = s[:-2]
+
+    return s
+
+
+def save_dataframe_preserve_text_xlsx(df, path, text_columns=None, sheet_name="Sheet1"):
+    if text_columns is None:
+        text_columns = []
+
+    export_df = df.copy()
+
+    for col in text_columns:
+        if col in export_df.columns:
+            export_df[col] = export_df[col].apply(force_text_export_value)
+
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        export_df.to_excel(writer, index=False, sheet_name=sheet_name)
+        ws = writer.sheets[sheet_name]
+
+        for col_idx, col_name in enumerate(export_df.columns, start=1):
+            if col_name in text_columns:
+                for row_idx in range(2, len(export_df) + 2):
+                    cell = ws.cell(row=row_idx, column=col_idx)
+                    cell.number_format = "@"
+                    cell.value = force_text_export_value(cell.value)
 
 def parse_pasted_pull_rows(raw_text: str):
     output_cols = [
@@ -301,14 +379,16 @@ class WarehouseApp(tk.Tk):
         self.manual_tag_rows = []
         self.batch_override_rows = None  # edited/final queue used for print/export when present
 
+        # unified tag queue: auto pull tags + manual tags can all be edited in one place
+
         # Warehouse columns
         self.W_PART = "Part"
         self.W_QTY = "OH Now"
         self.W_DATE_MAIN = "Date"
         self.W_DATE = "Last Updated"
         self.W_INOUT = "In/Out"
-        self.W_RM = "RM"
-        self.W_LOC = "Location"
+        self.W_RM = "Tekmor RM"
+        self.W_LOC = "Tekmor Loc"
 
         # Auto rename old comments column
         self.AUTO_RENAME_COMMENTS_TO_INOUT = True
@@ -661,7 +741,7 @@ class WarehouseApp(tk.Tk):
         log_rows = []
         shortage_rows = []
 
-        for _, row in pull.iterrows():
+        for pull_order, (_, row) in enumerate(pull.iterrows()):
             part = normalize_part(row.get(self.P_PART, ""))
             qty_raw = row.get(self.P_QTY, None)
 
@@ -722,6 +802,7 @@ class WarehouseApp(tk.Tk):
             existing_main_date = wh.at[w_idx, self.W_DATE_MAIN] if self.W_DATE_MAIN in wh.columns else ""
             existing_last_updated = wh.at[w_idx, self.W_DATE] if self.W_DATE in wh.columns else ""
             existing_inout = wh.at[w_idx, self.W_INOUT] if self.W_INOUT in wh.columns else ""
+            warehouse_rm = wh.at[w_idx, self.W_RM] if self.W_RM in wh.columns else ""
 
             effective_date_main = run_date if sent > 0 else existing_main_date
             effective_last_updated = run_date if sent > 0 else existing_last_updated
@@ -737,7 +818,9 @@ class WarehouseApp(tk.Tk):
                 "last_updated": effective_last_updated,
                 "date": run_date,
                 "inout": effective_inout,
-                "_w_idx": w_idx
+                "_w_idx": w_idx,
+                "_order": pull_order,
+                "warning": "⚠ HVWK ITEM" if is_hvwk(warehouse_rm) else ""
             })
 
         plan_df = pd.DataFrame(plan_rows)
@@ -745,7 +828,6 @@ class WarehouseApp(tk.Tk):
         shortages_df = pd.DataFrame(shortage_rows)
 
         if not plan_df.empty:
-            plan_df["_order"] = range(len(plan_df))
             final_rows = []
             current_after = {}
 
@@ -761,6 +843,7 @@ class WarehouseApp(tk.Tk):
                 existing_main_date = wh.at[w_idx, self.W_DATE_MAIN] if self.W_DATE_MAIN in wh.columns else ""
                 existing_last_updated = wh.at[w_idx, self.W_DATE] if self.W_DATE in wh.columns else ""
                 existing_inout = wh.at[w_idx, self.W_INOUT] if self.W_INOUT in wh.columns else ""
+                warehouse_rm = wh.at[w_idx, self.W_RM] if self.W_RM in wh.columns else ""
 
                 final_rows.append({
                     "part": p,
@@ -772,12 +855,14 @@ class WarehouseApp(tk.Tk):
                     "last_updated": today_mdy2() if sent > 0 else existing_last_updated,
                     "date": today_mdy2(),
                     "inout": -sent if sent > 0 else existing_inout,
-                    "_w_idx": w_idx
+                    "_w_idx": w_idx,
+                    "_order": int(r["_order"]),
+                    "warning": "⚠ HVWK ITEM" if is_hvwk(warehouse_rm) else ""
                 })
 
             plan_df = pd.DataFrame(final_rows)
 
-            plan_df = plan_df.groupby("part", as_index=False).agg(
+            plan_df = plan_df.groupby("part", as_index=False, sort=False).agg(
                 requested=("requested", "sum"),
                 sent=("sent", "sum"),
                 before=("before", "first"),
@@ -787,7 +872,11 @@ class WarehouseApp(tk.Tk):
                 date=("date", "first"),
                 inout=("inout", "last"),
                 _w_idx=("_w_idx", "first"),
+                _order=("_order", "min"),
+                warning=("warning", "max"),
             )
+
+            plan_df = plan_df.sort_values("_order", kind="stable").reset_index(drop=True)
 
         return plan_df, log_df, shortages_df
 
@@ -799,7 +888,7 @@ class WarehouseApp(tk.Tk):
 
         win = tk.Toplevel(self)
         win.title("Confirm Pull — Review Before Applying")
-        win.geometry("1040x560")
+        win.geometry("1180x560")
         win.grab_set()
 
         ttk.Label(
@@ -808,7 +897,11 @@ class WarehouseApp(tk.Tk):
             font=("Segoe UI", 11, "bold")
         ).pack(anchor="w", padx=12, pady=(12, 8))
 
-        cols = ["part", "requested", "sent", "before", "after", "date_main", "inout"]
+        display_df = plan_df.copy()
+        if "_order" in display_df.columns:
+            display_df = display_df.sort_values("_order", kind="stable").reset_index(drop=True)
+
+        cols = ["part", "requested", "sent", "before", "after", "date_main", "inout", "warning"]
         tree = ttk.Treeview(win, columns=cols, show="headings")
         tree.pack(fill=tk.BOTH, expand=True, padx=12, pady=8)
 
@@ -819,23 +912,45 @@ class WarehouseApp(tk.Tk):
             "before": "BEFORE",
             "after": "AFTER",
             "date_main": "DATE",
-            "inout": "IN/OUT"
+            "inout": "IN/OUT",
+            "warning": "ALERT"
+        }
+
+        widths = {
+            "part": 140,
+            "requested": 110,
+            "sent": 90,
+            "before": 110,
+            "after": 110,
+            "date_main": 110,
+            "inout": 90,
+            "warning": 240,
         }
 
         for c in cols:
             tree.heading(c, text=headings.get(c, c.upper()))
-            tree.column(c, width=130, stretch=True)
+            tree.column(c, width=widths.get(c, 120), stretch=True)
 
-        for _, r in plan_df.iterrows():
-            tree.insert("", "end", values=[r[c] for c in cols])
+        tree.tag_configure("hvwk", background="#fff3cd")
+
+        for _, r in display_df.iterrows():
+            vals = [r.get(c, "") for c in cols]
+            tags = ("hvwk",) if str(r.get("warning", "")).strip() else ()
+            tree.insert("", "end", values=vals, tags=tags)
 
         totals = {
-            "requested": int(plan_df["requested"].sum()),
-            "sent": int(plan_df["sent"].sum()),
+            "requested": int(display_df["requested"].sum()),
+            "sent": int(display_df["sent"].sum()),
         }
+        hvwk_count = int((display_df.get("warning", "").astype(str).str.strip() != "").sum()) if "warning" in display_df.columns else 0
+
+        total_text = f"TOTALS — Requested: {totals['requested']}   |   Sent: {totals['sent']}"
+        if hvwk_count:
+            total_text += f"   |   HVWK Alerts: {hvwk_count}"
+
         ttk.Label(
             win,
-            text=f"TOTALS — Requested: {totals['requested']}   |   Sent: {totals['sent']}",
+            text=total_text,
         ).pack(anchor="w", padx=12, pady=(0, 10))
 
         btn_frame = ttk.Frame(win)
@@ -1293,10 +1408,16 @@ class WarehouseApp(tk.Tk):
 
         return " ".join([x for x in [rm, loc] if x and x.lower() != "nan"]).strip()
 
-    def _make_tag_row(self, part, qty, job, loc, date_text, source):
+    def _make_tag_row(self, part, qty, job, loc, date_text, source, qty_value=None):
+        qty_text = self._zpl_safe(qty)
+        qty_num = qty_value
+        if qty_num is None:
+            parsed_qty, _ = parse_qty(qty)
+            qty_num = parsed_qty if isinstance(parsed_qty, int) else 0
         return {
             "part": self._zpl_safe(part),
-            "qty": int(qty),
+            "qty": qty_text,
+            "qty_value": int(qty_num) if str(qty_num).strip() not in ("", "ALL") else 0,
             "job": self._zpl_safe(job),
             "loc": self._zpl_safe(loc),
             "date": self._zpl_safe(date_text),
@@ -1345,6 +1466,7 @@ class WarehouseApp(tk.Tk):
             if sent <= 0:
                 continue
 
+            qty_display = format_tag_qty(qty_raw, sent)
             remaining_to_tag[part] -= sent
 
             job1 = self._pull_value(row, self.P_JOB, self.P_COL_JOB_IDX)
@@ -1364,11 +1486,12 @@ class WarehouseApp(tk.Tk):
 
             tag_rows.append(self._make_tag_row(
                 part=part,
-                qty=sent,
+                qty=qty_display,
+                qty_value=sent,
                 job=job_text,
                 loc=loc_full,
                 date_text=run_date,
-                source="pull"
+                source="auto"
             ))
 
         return tag_rows
@@ -1400,10 +1523,10 @@ class WarehouseApp(tk.Tk):
         lines.append("Tag Batch Preview")
         lines.append("-" * 40)
         lines.append(f"Total Tags Queued: {len(all_rows)}")
-        pull_count = sum(1 for r in all_rows if r.get("source") == "pull")
+        auto_count = sum(1 for r in all_rows if r.get("source") == "auto")
         manual_count = sum(1 for r in all_rows if r.get("source") == "manual")
         edited_count = sum(1 for r in all_rows if r.get("source") == "edited")
-        lines.append(f"Pull Tags: {pull_count}")
+        lines.append(f"Auto Tags: {auto_count}")
         lines.append(f"Manual Tags: {manual_count}")
         lines.append(f"Edited Tags: {edited_count}")
         lines.append("")
@@ -1581,8 +1704,8 @@ class WarehouseApp(tk.Tk):
         self.manual_tag_rows = []
         self.reset_batch_override()
         self.update_tag_preview()
-        self.status_var.set("Manual tag batch cleared.")
-        messagebox.showinfo("Cleared", "Manual tag batch cleared.")
+        self.status_var.set("Manual tag batch cleared from source queue.")
+        messagebox.showinfo("Cleared", "Manual tag batch cleared. Auto-generated pull tags remain available.")
 
     def _manual_tag_dialog(self, initial=None):
         result = {}
@@ -1626,7 +1749,8 @@ class WarehouseApp(tk.Tk):
         def save_now():
             try:
                 part = normalize_part(part_var.get())
-                qty = int(qty_var.get().strip())
+                qty_input = qty_var.get().strip()
+                qty = int(qty_input)
                 job = job_var.get().strip()
                 loc = loc_var.get().strip()
                 date_text = date_var.get().strip() or today_mdy2()
@@ -1638,7 +1762,8 @@ class WarehouseApp(tk.Tk):
 
                 result["row"] = self._make_tag_row(
                     part=part,
-                    qty=qty,
+                    qty=qty_input,
+                    qty_value=qty,
                     job=job,
                     loc=loc,
                     date_text=date_text,
@@ -1670,7 +1795,7 @@ class WarehouseApp(tk.Tk):
 
         ttk.Label(
             outer,
-            text="Review, edit, and print the exact tag batch.",
+            text="Review, edit, add, delete, and print the full tag queue (auto + manual).",
             font=("Segoe UI", 11, "bold")
         ).pack(anchor="w", pady=(0, 10))
 
@@ -1757,11 +1882,26 @@ class WarehouseApp(tk.Tk):
                 messagebox.showinfo("No Selection", "Select a tag row first.")
                 return
 
-            part = batch_rows[idx].get("part", "")
+            row = dict(batch_rows[idx])
+            part = row.get("part", "")
             del batch_rows[idx]
             mark_override()
             refresh_tree()
             self.status_var.set(f"Deleted tag for part {part} from current batch.")
+
+        def duplicate_selected():
+            idx = selected_index()
+            if idx is None:
+                messagebox.showinfo("No Selection", "Select a tag row first.")
+                return
+
+            row = dict(batch_rows[idx])
+            row["source"] = "manual" if row.get("source") == "manual" else "edited"
+            batch_rows.insert(idx + 1, row)
+            mark_override()
+            refresh_tree()
+            tree.selection_set(str(idx + 1))
+            self.status_var.set(f"Duplicated tag for part {row.get('part', '')}.")
 
         def clear_manual_only():
             self.manual_tag_rows = []
@@ -1770,13 +1910,15 @@ class WarehouseApp(tk.Tk):
             batch_rows = self.get_current_batch_rows()
             refresh_tree()
             self.update_tag_preview()
+            self.status_var.set("Manual source tags cleared. Auto pull tags kept.")
 
-        def refresh_from_sources():
+        def restore_auto_queue():
             self.reset_batch_override()
             nonlocal batch_rows
-            batch_rows = self.get_current_batch_rows()
+            batch_rows = self.get_source_tag_rows()
             refresh_tree()
             self.update_tag_preview()
+            self.status_var.set("Tag queue restored from auto pull tags + manual source tags.")
 
         def export_current():
             self.batch_override_rows = [dict(r) for r in batch_rows]
@@ -1794,11 +1936,12 @@ class WarehouseApp(tk.Tk):
         btns = ttk.Frame(outer)
         btns.pack(fill=tk.X)
 
-        ttk.Button(btns, text="Add Manual Tag", command=add_manual).pack(side=tk.LEFT)
+        ttk.Button(btns, text="Add Tag", command=add_manual).pack(side=tk.LEFT)
         ttk.Button(btns, text="Edit Selected", command=edit_selected).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(btns, text="Duplicate Selected", command=duplicate_selected).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(btns, text="Delete Selected", command=delete_selected).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Button(btns, text="Clear Manual Tags", command=clear_manual_only).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Button(btns, text="Refresh From Sources", command=refresh_from_sources).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(btns, text="Clear Manual Tags Only", command=clear_manual_only).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(btns, text="Restore Source Queue", command=restore_auto_queue).pack(side=tk.LEFT, padx=(8, 0))
 
         right_btns = ttk.Frame(outer)
         right_btns.pack(fill=tk.X, pady=(10, 0))
@@ -1862,19 +2005,38 @@ class WarehouseApp(tk.Tk):
         if self.warehouse_df is None:
             messagebox.showinfo("No Data", "Nothing to save. Load a warehouse file first.")
             return
+
         path = filedialog.asksaveasfilename(
             title="Save Updated Warehouse As",
-            initialfile=safe_default_filename("Warehouse_UPDATED"),
-            defaultextension=".csv",
-            filetypes=[("CSV files", "*.csv")]
+            initialfile=safe_default_filename("Warehouse_UPDATED", "xlsx"),
+            defaultextension=".xlsx",
+            filetypes=[
+                ("Excel files", "*.xlsx"),
+                ("CSV files", "*.csv")
+            ]
         )
         if not path:
             return
+
         try:
-            self.warehouse_df.to_csv(path, index=False)
+            if path.lower().endswith(".xlsx"):
+                text_columns = [self.W_PART, self.W_RM, self.W_LOC, self.W_DATE_MAIN, self.W_DATE, self.W_INOUT]
+                save_dataframe_preserve_text_xlsx(
+                    self.warehouse_df,
+                    path,
+                    text_columns=text_columns,
+                    sheet_name="Updated Warehouse"
+                )
+            else:
+                export_df = self.warehouse_df.copy()
+                for col in [self.W_PART, self.W_RM, self.W_LOC, self.W_DATE_MAIN, self.W_DATE, self.W_INOUT]:
+                    if col in export_df.columns:
+                        export_df[col] = export_df[col].apply(force_text_export_value)
+                export_df.to_csv(path, index=False)
+
             self.status_var.set(f"Saved updated warehouse: {os.path.basename(path)}")
         except Exception as e:
-            messagebox.showerror("Save Error", f"Could not save file.\n\n{e}")
+           messagebox.showerror("Save Error", f"Could not save file:\n{e}")
 
     def export_log(self):
         if self.log_df is None or self.log_df.empty:
@@ -2156,3 +2318,10 @@ class WarehouseApp(tk.Tk):
 if __name__ == "__main__":
     app = WarehouseApp()
     app.mainloop()
+
+
+# ---- HVWK Warning Hook ----
+def hvwk_warning(part, rm):
+    if is_hvwk(rm):
+        return "⚠ HVWK ITEM"
+    return ""

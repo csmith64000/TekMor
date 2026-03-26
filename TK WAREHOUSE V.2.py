@@ -881,14 +881,15 @@ class WarehouseApp(tk.Tk):
         return plan_df, log_df, shortages_df
 
     # ---------- Confirmation windows ----------
+    
     def confirm_pull_window(self, plan_df: pd.DataFrame) -> bool:
         if plan_df is None or plan_df.empty:
-            messagebox.showinfo("Nothing to Apply", "No valid parts to apply (everything skipped/not found).")
+            messagebox.showinfo("Nothing to Apply", "No valid parts to apply.")
             return False
 
         win = tk.Toplevel(self)
         win.title("Confirm Pull — Review Before Applying")
-        win.geometry("1180x560")
+        win.geometry("1200x720")
         win.grab_set()
 
         ttk.Label(
@@ -898,60 +899,81 @@ class WarehouseApp(tk.Tk):
         ).pack(anchor="w", padx=12, pady=(12, 8))
 
         display_df = plan_df.copy()
-        if "_order" in display_df.columns:
-            display_df = display_df.sort_values("_order", kind="stable").reset_index(drop=True)
 
-        cols = ["part", "requested", "sent", "before", "after", "date_main", "inout", "warning"]
-        tree = ttk.Treeview(win, columns=cols, show="headings")
-        tree.pack(fill=tk.BOTH, expand=True, padx=12, pady=8)
+        if "_order" in display_df.columns:
+            display_df = display_df.sort_values("_order", kind="stable")
+
+        full_df = display_df[display_df["sent"] == display_df["requested"]]
+        short_df = display_df[display_df["sent"] < display_df["requested"]].copy()
+        short_df["short_by"] = short_df["requested"] - short_df["sent"]
+
+        cols = ["part","requested","sent","short_by","before","after","date_main","inout","warning"]
 
         headings = {
-            "part": "PART",
-            "requested": "REQUESTED",
-            "sent": "SENT",
-            "before": "BEFORE",
-            "after": "AFTER",
-            "date_main": "DATE",
-            "inout": "IN/OUT",
-            "warning": "ALERT"
+            "part":"PART",
+            "requested":"REQUESTED",
+            "sent":"SENT",
+            "short_by":"SHORT",
+            "before":"BEFORE",
+            "after":"AFTER",
+            "date_main":"DATE",
+            "inout":"IN/OUT",
+            "warning":"ALERT"
         }
 
-        widths = {
-            "part": 140,
-            "requested": 110,
-            "sent": 90,
-            "before": 110,
-            "after": 110,
-            "date_main": 110,
-            "inout": 90,
-            "warning": 240,
-        }
+        def build_section(title, df):
 
-        for c in cols:
-            tree.heading(c, text=headings.get(c, c.upper()))
-            tree.column(c, width=widths.get(c, 120), stretch=True)
+            ttk.Label(
+                win,
+                text=title,
+                font=("Segoe UI", 10, "bold")
+            ).pack(anchor="w", padx=12, pady=(10,2))
 
-        tree.tag_configure("hvwk", background="#fff3cd")
+            tree = ttk.Treeview(win, columns=cols, show="headings", height=8)
+            tree.pack(fill=tk.X, padx=12)
 
-        for _, r in display_df.iterrows():
-            vals = [r.get(c, "") for c in cols]
-            tags = ("hvwk",) if str(r.get("warning", "")).strip() else ()
-            tree.insert("", "end", values=vals, tags=tags)
+            for c in cols:
+                tree.heading(c, text=headings[c])
+                tree.column(c, width=110)
+
+            tree.tag_configure("hvwk", background="#fff3cd")
+            tree.tag_configure("short", background="#ffe6e6")
+
+            for _, r in df.iterrows():
+                tags = []
+                if str(r.get("warning","")).strip():
+                    tags.append("hvwk")
+                if r["sent"] < r["requested"]:
+                    tags.append("short")
+
+                vals = [
+                    r.get("part",""),
+                    r.get("requested",""),
+                    r.get("sent",""),
+                    r.get("short_by",""),
+                    r.get("before",""),
+                    r.get("after",""),
+                    r.get("date_main",""),
+                    r.get("inout",""),
+                    r.get("warning","")
+                ]
+
+                tree.insert("", "end", values=vals, tags=tuple(tags))
+
+        build_section("Shipped In Full", full_df)
+        build_section("Short / Partial / Zero Available", short_df)
 
         totals = {
             "requested": int(display_df["requested"].sum()),
             "sent": int(display_df["sent"].sum()),
+            "short_lines": len(short_df),
+            "full_lines": len(full_df)
         }
-        hvwk_count = int((display_df.get("warning", "").astype(str).str.strip() != "").sum()) if "warning" in display_df.columns else 0
-
-        total_text = f"TOTALS — Requested: {totals['requested']}   |   Sent: {totals['sent']}"
-        if hvwk_count:
-            total_text += f"   |   HVWK Alerts: {hvwk_count}"
 
         ttk.Label(
             win,
-            text=total_text,
-        ).pack(anchor="w", padx=12, pady=(0, 10))
+            text=f"TOTALS — Requested: {totals['requested']} | Sent: {totals['sent']} | Full: {totals['full_lines']} | Short: {totals['short_lines']}"
+        ).pack(anchor="w", padx=12, pady=10)
 
         btn_frame = ttk.Frame(win)
         btn_frame.pack(fill=tk.X, padx=12, pady=(0, 12))
@@ -966,11 +988,12 @@ class WarehouseApp(tk.Tk):
             result["ok"] = False
             win.destroy()
 
-        ttk.Button(btn_frame, text="APPLY PULL", command=on_apply).pack(side=tk.RIGHT, padx=(8, 0))
+        ttk.Button(btn_frame, text="APPLY PULL", command=on_apply).pack(side=tk.RIGHT, padx=(8,0))
         ttk.Button(btn_frame, text="Cancel", command=on_cancel).pack(side=tk.RIGHT)
 
         self.wait_window(win)
         return result["ok"]
+
 
     def confirm_manual_adjust_window(self, part, mode, qty, before, delta, after, date_display):
         win = tk.Toplevel(self)
